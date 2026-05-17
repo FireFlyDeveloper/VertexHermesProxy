@@ -1,32 +1,36 @@
 #!/usr/bin/env node
 /**
- * Vertex AI → OpenAI Compatible Proxy
- * Complete implementation matching OpenAI Chat Completions API spec
- * 
- * Fixes:
- *  - stream default = false (OpenAI spec compliance)
- *  - thought_signature support for Gemini 3.x tool calling
- *  - finish_reason = "tool_calls" when appropriate
- *  - \r\n-safe SSE parsing
- *  - Full OpenAI request/response schema compliance
+ * Vertex AI → OpenAI Compatible Proxy (v3 - Tool Grouping Fix)
+ *
+ * Critical fixes:
+ *  1. Group consecutive role="tool" messages into ONE Vertex user turn
+ *     (Vertex requires: #functionResponse parts == #functionCall parts)
+ *  2. functionResponse.response = raw object, NOT wrapped in {result: ...}
+ *  3. Spec-compliant SSE parser (handles \r\n, multi-line data)
+ *  4. stream default = false (OpenAI spec)
+ *  5. thought_signature bidirectional pass-through
  */
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 
-// ─── Configuration ─────────────────────────────────────────────
+// ─── Config ────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY || '';
 const PROJECT_ID = process.env.GOOGLE_PROJECT_ID || '';
 const LOCATION = process.env.GOOGLE_LOCATION || 'us-central1';
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'gemini-3.1-flash-lite';
+const DEBUG = process.env.DEBUG === '1';
 
 if (!API_KEY) {
-  console.error('Error: GOOGLE_API_KEY environment variable is required');
+  console.error('[FATAL] GOOGLE_API_KEY required');
   process.exit(1);
 }
 
-// ─── Helpers ───────────────────────────────────────────────────
+function log(...args) {
+  if (DEBUG) console.error('[DEBUG]', ...args);
+}
+
 function generateId(prefix = 'chatcmpl') {
   return `${prefix}-${Date.now().toString(16)}${Math.random().toString(36).substring(2, 10)}`;
 }
@@ -38,51 +42,142 @@ function getVertexUrl(model) {
   return `https://aiplatform.googleapis.com/v1beta1/publishers/google/models/${model}:streamGenerateContent?alt=sse&key=${API_KEY}`;
 }
 
+// ─── Safe JSON Parse ───────────────────────────────────────────
+function safeJsonParse(str, ctx) {
+  try {
+    return JSON.parse(str);
+  } catch (e) {
+    log('[JSON-FAIL]', ctx, 'input:', str.substring(0, 200), 'err:', e.message);
+    throw new Error(`JSON parse failed (${ctx}): ${e.message}`);
+  }
+}
+
+// ─── SSE Parser (spec-compliant: splits on \r\n\r\n / \n\n) ─────
+class SseParser {
+  constructor() {
+    this.buffer = '';
+  }
+  feed(text) {
+    this.buffer += text;
+    const events = [];
+    // SSE events separated by blank lines
+    const parts = this.buffer.split(/(?:\r?\n){2,}/);
+    this.buffer = parts.pop() || '';
+    for (const part of parts) {
+      if (!part.trim()) continue;
+      const lines = part.split(/\r?\n/);
+      const dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith('data:')) {
+          dataLines.push(line.slice(5).trimStart());
+        }
+      }
+      if (dataLines.length) events.push(dataLines.join('\n'));
+    }
+    return events;
+  }
+  flush() {
+    const events = [];
+    if (this.buffer.trim()) {
+      const lines = this.buffer.split(/\r?\n/);
+      const dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+      }
+      if (dataLines.length) events.push(dataLines.join('\n'));
+    }
+    this.buffer = '';
+    return events;
+  }
+}
+
 // ─── OpenAI → Vertex Request Translator ────────────────────────
 function openAIToVertex(openaiBody) {
   const model = openaiBody.model || DEFAULT_MODEL;
   const contents = [];
   let systemInstruction = null;
+  const messages = openaiBody.messages || [];
+  let i = 0;
 
-  for (const msg of openaiBody.messages || []) {
-    // Map developer role to system for Vertex
+  while (i < messages.length) {
+    const msg = messages[i];
+
+    // ── System / Developer messages ────────────────────────────
     if (msg.role === 'system' || msg.role === 'developer') {
       if (typeof msg.content === 'string') {
         systemInstruction = { parts: [{ text: msg.content }] };
       }
+      i++;
       continue;
     }
 
+    // ── Group consecutive tool/function responses ──────────────
+    // CRITICAL: Vertex requires ALL function responses in ONE user turn
+    if (msg.role === 'tool' || msg.role === 'function') {
+      const toolGroup = [];
+      while (i < messages.length && (messages[i].role === 'tool' || messages[i].role === 'function')) {
+        toolGroup.push(messages[i]);
+        i++;
+      }
+
+      const parts = toolGroup.map(t => {
+        let responseData;
+        if (typeof t.content === 'string') {
+          try {
+            responseData = JSON.parse(t.content);
+          } catch {
+            // Plain text → wrap in object (Vertex requires object)
+            responseData = { result: t.content };
+          }
+        } else if (t.content !== null && typeof t.content === 'object') {
+          responseData = t.content;
+        } else {
+          responseData = { result: String(t.content ?? '') };
+        }
+
+        return {
+          functionResponse: {
+            name: t.name || t.function?.name || 'unknown',
+            response: responseData
+          }
+        };
+      });
+
+      log('[TOOL-GROUP]', toolGroup.length, 'tools grouped into 1 turn');
+      contents.push({ role: 'user', parts });
+      continue;
+    }
+
+    // ── Normal user / assistant messages ───────────────────────
     const role = msg.role === 'assistant' ? 'model' : 'user';
     let parts = [];
 
-    // Handle string content
+    // Content parsing
     if (typeof msg.content === 'string') {
       parts.push({ text: msg.content });
-    }
-    // Handle array content (multimodal)
-    else if (Array.isArray(msg.content)) {
+    } else if (Array.isArray(msg.content)) {
       for (const item of msg.content) {
         if (item.type === 'text') {
           parts.push({ text: item.text });
         } else if (item.type === 'image_url') {
           const imageUrl = item.image_url?.url || '';
           if (imageUrl.startsWith('data:')) {
-            const match = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
-            if (match) {
-              parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
-            }
+            const m = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
+            if (m) parts.push({ inlineData: { mimeType: m[1], data: m[2] } });
           } else {
             parts.push({ fileData: { mimeType: 'image/jpeg', fileUri: imageUrl } });
           }
         } else if (item.type === 'input_audio') {
-          parts.push({ inlineData: { mimeType: `audio/${item.input_audio?.format || 'wav'}`, data: item.input_audio?.data || '' } });
+          parts.push({
+            inlineData: {
+              mimeType: `audio/${item.input_audio?.format || 'wav'}`,
+              data: item.input_audio?.data || ''
+            }
+          });
         } else if (item.type === 'file') {
           if (item.file?.file_data) {
-            const match = item.file.file_data.match(/^data:([^;]+);base64,(.+)$/);
-            if (match) {
-              parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
-            }
+            const m = item.file.file_data.match(/^data:([^;]+);base64,(.+)$/);
+            if (m) parts.push({ inlineData: { mimeType: m[1], data: m[2] } });
           } else if (item.file?.file_id) {
             parts.push({ fileData: { mimeType: 'application/octet-stream', fileUri: item.file.file_id } });
           }
@@ -90,64 +185,45 @@ function openAIToVertex(openaiBody) {
       }
     }
 
-    // Handle tool_calls (function calls from assistant)
+    // tool_calls (assistant → model function calls)
     if (msg.tool_calls && msg.tool_calls.length > 0) {
       for (const tc of msg.tool_calls) {
-        const fcPart = {
-          functionCall: {
-            name: tc.function.name,
-            args: JSON.parse(tc.function.arguments || '{}')
+        let args = {};
+        if (tc.function?.arguments) {
+          if (typeof tc.function.arguments === 'string') {
+            try { args = JSON.parse(tc.function.arguments); } catch { args = {}; }
+          } else if (typeof tc.function.arguments === 'object') {
+            args = tc.function.arguments;
           }
-        };
-        // CRITICAL: Pass thought_signature back to Vertex for Gemini 3.x
-        const sig = tc.extra_content?.google?.thought_signature || tc.thoughtSignature || tc.thought_signature;
-        if (sig) {
-          fcPart.thoughtSignature = sig;
         }
+        const fcPart = { functionCall: { name: tc.function?.name || 'unknown', args } };
+        // Pass thought_signature back (critical for Gemini 3.x)
+        const sig = tc.extra_content?.google?.thought_signature
+                 || tc.thoughtSignature
+                 || tc.thought_signature;
+        if (sig) fcPart.thoughtSignature = sig;
         parts.push(fcPart);
       }
     }
 
-    // Handle tool response (function response from user/tool role)
-    if (msg.role === 'tool' && msg.content) {
-      parts = [{
-        functionResponse: {
-          name: msg.name || 'unknown',
-          response: {
-            result: typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content
-          }
-        }
-      }];
-    }
-
-    // Handle deprecated function_call
+    // Deprecated function_call
     if (msg.function_call) {
-      parts.push({
-        functionCall: {
-          name: msg.function_call.name,
-          args: JSON.parse(msg.function_call.arguments || '{}')
-        }
-      });
-    }
-
-    // Handle deprecated function role response
-    if (msg.role === 'function' && msg.content) {
-      parts = [{
-        functionResponse: {
-          name: msg.name || 'unknown',
-          response: {
-            result: typeof msg.content === 'string' ? JSON.parse(msg.content) : msg.content
-          }
-        }
-      }];
+      let args = {};
+      if (typeof msg.function_call.arguments === 'string') {
+        try { args = JSON.parse(msg.function_call.arguments); } catch { args = {}; }
+      } else if (typeof msg.function_call.arguments === 'object') {
+        args = msg.function_call.arguments;
+      }
+      parts.push({ functionCall: { name: msg.function_call.name, args } });
     }
 
     if (parts.length > 0) {
       contents.push({ role, parts });
     }
+    i++;
   }
 
-  // Build generation config
+  // ── Generation Config ────────────────────────────────────────
   const generationConfig = {
     temperature: openaiBody.temperature ?? 1,
     maxOutputTokens: openaiBody.max_tokens || 65535,
@@ -156,13 +232,14 @@ function openAIToVertex(openaiBody) {
     candidateCount: openaiBody.n || 1,
     stopSequences: openaiBody.stop ? (Array.isArray(openaiBody.stop) ? openaiBody.stop : [openaiBody.stop]) : undefined
   };
-  Object.keys(generationConfig).forEach(key => {
-    if (generationConfig[key] === undefined) delete generationConfig[key];
+  Object.keys(generationConfig).forEach(k => {
+    if (generationConfig[k] === undefined) delete generationConfig[k];
   });
 
-  // Build tools config
+  // ── Tools / Functions ────────────────────────────────────────
   let tools = null;
   let toolConfig = null;
+
   if (openaiBody.tools) {
     tools = openaiBody.tools.map(t => ({
       functionDeclarations: [{
@@ -171,9 +248,7 @@ function openAIToVertex(openaiBody) {
         parameters: t.function.parameters
       }]
     }));
-  }
-  // Handle deprecated functions
-  else if (openaiBody.functions) {
+  } else if (openaiBody.functions) {
     tools = openaiBody.functions.map(f => ({
       functionDeclarations: [{
         name: f.name,
@@ -183,10 +258,9 @@ function openAIToVertex(openaiBody) {
     }));
   }
 
-  // Handle tool_choice / function_call
   if (openaiBody.tool_choice === 'none') {
     toolConfig = { functionCallingConfig: { mode: 'NONE' } };
-  } else if (openaiBody.tool_choice === 'auto' || openaiBody.tool_choice === undefined) {
+  } else if (openaiBody.tool_choice === 'auto' || openaiBody.tool_choice == null) {
     toolConfig = { functionCallingConfig: { mode: 'AUTO' } };
   } else if (typeof openaiBody.tool_choice === 'object' && openaiBody.tool_choice?.function?.name) {
     toolConfig = { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [openaiBody.tool_choice.function.name] } };
@@ -211,11 +285,16 @@ function openAIToVertex(openaiBody) {
   if (tools) vertexBody.tools = tools;
   if (toolConfig) vertexBody.toolConfig = toolConfig;
 
+  log('[VERTEX-CONTENTS-COUNT]', contents.length);
+  contents.forEach((c, idx) => {
+    log(`  [${idx}] role=${c.role} parts=${c.parts.length}`,
+      c.parts.map(p => Object.keys(p).join(',')).join(' | '));
+  });
+
   return { model, vertexBody };
 }
 
-// ─── Vertex → OpenAI Response Translators ──────────────────────
-
+// ─── Vertex → OpenAI Translators ───────────────────────────────
 function mapFinishReason(vertexFinishReason, hasToolCalls) {
   if (!vertexFinishReason) return null;
   const map = {
@@ -228,55 +307,37 @@ function mapFinishReason(vertexFinishReason, hasToolCalls) {
   return map[vertexFinishReason] || 'stop';
 }
 
-function buildOpenAIStreamingChunk(vertexChunk, id, model, isFirst, accumulatedToolCalls) {
+function buildOpenAIStreamingChunk(vertexChunk, id, model, isFirst) {
   const candidate = vertexChunk.candidates?.[0];
   if (!candidate) return null;
-
-  const content = candidate.content;
-  const finishReason = candidate.finishReason;
+  const parts = candidate.content?.parts || [];
   let delta = {};
   let hasToolCalls = false;
 
-  // First chunk should set role
-  if (isFirst) {
-    delta.role = 'assistant';
-  }
+  if (isFirst) delta.role = 'assistant';
 
-  // Handle text parts
-  if (content?.parts) {
-    for (let i = 0; i < content.parts.length; i++) {
-      const part = content.parts[i];
-      if (part.text !== undefined) {
-        delta.content = part.text;
-      }
-      if (part.functionCall) {
-        hasToolCalls = true;
-        const fc = part.functionCall;
-        const tc = {
-          index: 0,
-          id: `call_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 6)}`,
-          type: 'function',
-          function: {
-            name: fc.name,
-            arguments: JSON.stringify(fc.args || {})
-          }
-        };
-        // Include thought_signature for Gemini 3.x compatibility
-        if (part.thoughtSignature || part.thought_signature) {
-          tc.extra_content = {
-            google: {
-              thought_signature: part.thoughtSignature || part.thought_signature
-            }
-          };
+  for (const part of parts) {
+    if (part.text != null) delta.content = part.text;
+    if (part.functionCall) {
+      hasToolCalls = true;
+      const fc = part.functionCall;
+      const tc = {
+        index: 0,
+        id: `call_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 6)}`,
+        type: 'function',
+        function: {
+          name: fc.name,
+          arguments: JSON.stringify(fc.args || {})
         }
-        delta.tool_calls = [tc];
+      };
+      if (part.thoughtSignature || part.thought_signature) {
+        tc.extra_content = { google: { thought_signature: part.thoughtSignature || part.thought_signature } };
       }
+      delta.tool_calls = [tc];
     }
   }
 
-  const mappedFinish = mapFinishReason(finishReason, hasToolCalls);
-
-  const chunk = {
+  return {
     id: `chatcmpl-${id}`,
     object: 'chat.completion.chunk',
     created: Math.floor(Date.now() / 1000),
@@ -284,78 +345,49 @@ function buildOpenAIStreamingChunk(vertexChunk, id, model, isFirst, accumulatedT
     choices: [{
       index: 0,
       delta: delta,
-      finish_reason: mappedFinish,
+      finish_reason: mapFinishReason(candidate.finishReason, hasToolCalls),
       logprobs: null
     }]
   };
-
-  return `data: ${JSON.stringify(chunk)}\n\n`;
 }
 
-function buildOpenAIFinalChunk(model, id) {
-  const chunk = {
-    id: `chatcmpl-${id}`,
-    object: 'chat.completion.chunk',
-    created: Math.floor(Date.now() / 1000),
-    model: model,
-    choices: [{
-      index: 0,
-      delta: {},
-      finish_reason: null,
-      logprobs: null
-    }]
-  };
-  return `data: ${JSON.stringify(chunk)}\n\n`;
-}
-
-function buildOpenAINonStreamingResponse(vertexData, id, model) {
-  const lines = vertexData.split('\n').filter(l => l.trim().startsWith('data: '));
+function buildOpenAINonStreamingResponse(events, id, model) {
   let fullText = '';
-  let toolCalls = [];
+  const toolCalls = [];
   let finishReason = 'stop';
   let hasToolCalls = false;
 
-  for (const line of lines) {
+  for (const event of events) {
+    if (event === '[DONE]') continue;
     try {
-      const chunk = JSON.parse(line.slice(6).trim());
+      const chunk = safeJsonParse(event, 'non-stream-vertex');
       const candidate = chunk.candidates?.[0];
       if (!candidate) continue;
-
-      const parts = candidate.content?.parts || [];
-      for (const part of parts) {
-        if (part.text !== undefined) {
-          fullText += part.text;
-        }
+      for (const part of candidate.content?.parts || []) {
+        if (part.text != null) fullText += part.text;
         if (part.functionCall) {
           hasToolCalls = true;
           const fc = part.functionCall;
           const tc = {
             id: `call_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 6)}`,
             type: 'function',
-            function: {
-              name: fc.name,
-              arguments: JSON.stringify(fc.args || {})
-            }
+            function: { name: fc.name, arguments: JSON.stringify(fc.args || {}) }
           };
-          // Include thought_signature
           if (part.thoughtSignature || part.thought_signature) {
-            tc.extra_content = {
-              google: {
-                thought_signature: part.thoughtSignature || part.thought_signature
-              }
-            };
+            tc.extra_content = { google: { thought_signature: part.thoughtSignature || part.thought_signature } };
           }
           toolCalls.push(tc);
         }
       }
-
       if (candidate.finishReason) {
         finishReason = mapFinishReason(candidate.finishReason, hasToolCalls);
       }
-    } catch {}
+    } catch (e) {
+      log('[NON-STREAM-PARSE-ERR]', e.message);
+    }
   }
 
-  const response = {
+  return {
     id: `chatcmpl-${id}`,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
@@ -378,13 +410,10 @@ function buildOpenAINonStreamingResponse(vertexData, id, model) {
       total_tokens: -1
     }
   };
-
-  return response;
 }
 
 // ─── HTTP Server ────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -395,7 +424,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Health check / models list
   if (req.url === '/health' || req.url === '/v1/models') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -410,55 +438,34 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Only handle chat completions
   if (req.url !== '/v1/chat/completions') {
     res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      error: {
-        message: 'Not found',
-        type: 'invalid_request_error',
-        param: null,
-        code: null
-      }
-    }));
+    res.end(JSON.stringify({ error: { message: 'Not found', type: 'invalid_request_error', param: null, code: null } }));
     return;
   }
 
   if (req.method !== 'POST') {
     res.writeHead(405, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      error: {
-        message: 'Method not allowed',
-        type: 'invalid_request_error',
-        param: null,
-        code: null
-      }
-    }));
+    res.end(JSON.stringify({ error: { message: 'Method not allowed', type: 'invalid_request_error', param: null, code: null } }));
     return;
   }
 
-  // Parse request body
   let body = '';
   req.on('data', chunk => body += chunk);
   await new Promise(resolve => req.on('end', resolve));
 
+  log('[REQUEST]', req.url, body.substring(0, 400));
+
   let openaiBody;
   try {
-    openaiBody = JSON.parse(body);
+    openaiBody = safeJsonParse(body, 'request-body');
   } catch (e) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      error: {
-        message: 'Invalid JSON in request body',
-        type: 'invalid_request_error',
-        param: null,
-        code: null
-      }
-    }));
+    res.end(JSON.stringify({ error: { message: e.message, type: 'invalid_request_error', param: null, code: null } }));
     return;
   }
 
-  // CRITICAL FIX: OpenAI default is stream=false
+  // OpenAI default: stream = false
   const stream = openaiBody.stream === true;
   const requestId = generateId();
 
@@ -473,112 +480,129 @@ const server = http.createServer(async (req, res) => {
         'Accept': 'text/event-stream'
       }
     };
+    if (PROJECT_ID) options.headers['Authorization'] = `Bearer ${API_KEY}`;
 
-    if (PROJECT_ID) {
-      options.headers['Authorization'] = `Bearer ${API_KEY}`;
-    }
+    log('[VERTEX-URL]', url.toString().replace(API_KEY, '***'));
+    log('[VERTEX-BODY]', JSON.stringify(vertexBody).substring(0, 1000));
 
     const vertexReq = https.request(url, options, (vertexRes) => {
+      log('[VERTEX-STATUS]', vertexRes.statusCode);
+
       if (vertexRes.statusCode !== 200) {
         let errorData = '';
         vertexRes.on('data', chunk => errorData += chunk);
         vertexRes.on('end', () => {
+          log('[VERTEX-ERROR]', errorData.substring(0, 400));
           res.writeHead(vertexRes.statusCode, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
-            error: {
-              message: `Vertex API error: ${errorData}`,
-              type: 'api_error',
-              param: null,
-              code: vertexRes.statusCode
-            }
+            error: { message: `Vertex API error: ${errorData}`, type: 'api_error', param: null, code: vertexRes.statusCode }
           }));
         });
         return;
       }
 
       if (stream) {
-        // SSE streaming response
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive'
         });
 
-        const decoder = new TextDecoder();
-        let buffer = '';
+        const decoder = new TextDecoder('utf-8');
+        const parser = new SseParser();
         let isFirst = true;
 
         vertexRes.on('data', (chunk) => {
-          buffer += decoder.decode(chunk, { stream: true });
-          // CRITICAL FIX: Handle \r\n and \n line endings
-          const lines = buffer.split(/\r?\n/);
-          buffer = lines.pop();
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data: ')) continue;
-            const json = trimmed.slice(6).trim();
-            if (!json || json === '[DONE]') continue;
-
+          const events = parser.feed(decoder.decode(chunk, { stream: true }));
+          for (const event of events) {
+            if (event === '[DONE]') continue;
             try {
-              const vertexChunk = JSON.parse(json);
+              const vertexChunk = safeJsonParse(event, 'stream-chunk');
               const openaiChunk = buildOpenAIStreamingChunk(vertexChunk, requestId, model, isFirst);
               isFirst = false;
-              if (openaiChunk) res.write(openaiChunk);
+              if (openaiChunk) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
             } catch (e) {
-              // Skip malformed chunks
+              log('[STREAM-PARSE-ERR]', e.message, event.substring(0, 200));
             }
           }
         });
 
         vertexRes.on('end', () => {
-          res.write(buildOpenAIFinalChunk(model, requestId));
+          try {
+            const events = parser.feed(decoder.decode());
+            for (const event of events) {
+              if (event === '[DONE]') continue;
+              try {
+                const vertexChunk = safeJsonParse(event, 'stream-end');
+                const openaiChunk = buildOpenAIStreamingChunk(vertexChunk, requestId, model, isFirst);
+                if (openaiChunk) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
+              } catch (e) {
+                log('[STREAM-END-ERR]', e.message);
+              }
+            }
+            const events2 = parser.flush();
+            for (const event of events2) {
+              if (event === '[DONE]') continue;
+              try {
+                const vertexChunk = safeJsonParse(event, 'stream-flush');
+                const openaiChunk = buildOpenAIStreamingChunk(vertexChunk, requestId, model, isFirst);
+                if (openaiChunk) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
+              } catch (e) {
+                log('[STREAM-FLUSH-ERR]', e.message);
+              }
+            }
+          } catch (e) {
+            log('[DECODER-FLUSH-ERR]', e.message);
+          }
+          res.write(`data: {"id":"chatcmpl-${requestId}","object":"chat.completion.chunk","created":${Math.floor(Date.now()/1000)},"model":"${model}","choices":[{"index":0,"delta":{},"finish_reason":null,"logprobs":null}]}\n\n`);
           res.write('data: [DONE]\n\n');
           res.end();
         });
 
         vertexRes.on('error', (err) => {
-          console.error('Vertex stream error:', err);
+          log('[VERTEX-STREAM-ERR]', err.message);
           res.end();
         });
       } else {
-        // Non-streaming response
-        let data = '';
-        vertexRes.on('data', chunk => data += chunk);
+        const decoder = new TextDecoder('utf-8');
+        const parser = new SseParser();
+
+        vertexRes.on('data', chunk => {
+          parser.feed(decoder.decode(chunk, { stream: true }));
+        });
+
         vertexRes.on('end', () => {
-          const response = buildOpenAINonStreamingResponse(data, requestId, model);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify(response));
+          try { parser.feed(decoder.decode()); } catch (e) { log('[DECODER-FLUSH]', e.message); }
+          const events = parser.flush();
+          log('[NON-STREAM-EVENTS]', events.length);
+
+          try {
+            const response = buildOpenAINonStreamingResponse(events, requestId, model);
+            log('[RESPONSE]', JSON.stringify(response).substring(0, 300));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(response));
+          } catch (e) {
+            log('[BUILD-RESPONSE-ERR]', e.message, e.stack);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: e.message, type: 'internal_error', param: null, code: null } }));
+          }
         });
       }
     });
 
     vertexReq.on('error', (err) => {
+      log('[VERTEX-REQ-ERR]', err.message);
       res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        error: {
-          message: err.message,
-          type: 'api_error',
-          param: null,
-          code: null
-        }
-      }));
+      res.end(JSON.stringify({ error: { message: err.message, type: 'api_error', param: null, code: null } }));
     });
 
     vertexReq.write(JSON.stringify(vertexBody));
     vertexReq.end();
 
   } catch (err) {
-    console.error('Proxy error:', err);
+    log('[PROXY-ERR]', err.message, err.stack);
     res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      error: {
-        message: err.message,
-        type: 'internal_error',
-        param: null,
-        code: null
-      }
-    }));
+    res.end(JSON.stringify({ error: { message: err.message, type: 'internal_error', param: null, code: null } }));
   }
 });
 
@@ -586,7 +610,7 @@ server.listen(PORT, () => {
   console.log(`Vertex AI OpenAI Proxy running on port ${PORT}`);
   console.log(`Default model: ${DEFAULT_MODEL}`);
   console.log(`Endpoint: http://localhost:${PORT}/v1/chat/completions`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Debug: ${DEBUG ? 'enabled' : 'disabled'} (DEBUG=1)`);
 });
 
 process.on('SIGTERM', () => {
