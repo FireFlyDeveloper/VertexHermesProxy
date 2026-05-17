@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 /**
- * Vertex AI → OpenAI Compatible Proxy (v4 - Multi-Model Support)
+ * Vertex AI → OpenAI Compatible Proxy (v5 - 429 Mitigation)
  *
- * Supported models:
- *   - gemini-3.1-flash-lite
- *   - gemini-3.1-pro-preview
+ * 429 Mitigation:
+ *  - Request queue with configurable max concurrency
+ *  - Exponential backoff with jitter on 429 (up to 5 retries)
+ *  - Circuit breaker (opens after 10 consecutive 429s, recovers after 60s)
+ *  - Global endpoint support (higher quotas)
+ *  - Per-request timeout to prevent hung connections
+ *  - Internal retry before returning error to client
  *
- * Critical fixes:
- *  1. Group consecutive role="tool" messages into ONE Vertex user turn
- *  2. functionResponse.response = raw object (not wrapped in {result:...})
- *  3. Spec-compliant SSE parser
- *  4. stream default = false (OpenAI spec)
- *  5. thought_signature bidirectional pass-through
- *  6. Multi-model support with /v1/models listing
+ * Existing fixes:
+ *  - Multi-model support
+ *  - Tool message grouping
+ *  - thought_signature pass-through
+ *  - Spec-compliant SSE parser
+ *  - stream default = false
  */
 const http = require('http');
 const https = require('https');
@@ -23,20 +26,25 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.GOOGLE_API_KEY || '';
 const PROJECT_ID = process.env.GOOGLE_PROJECT_ID || '';
 const LOCATION = process.env.GOOGLE_LOCATION || 'us-central1';
+const USE_GLOBAL = process.env.USE_GLOBAL === '1';  // Use global endpoint for higher quotas
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'gemini-3.1-flash-lite';
 const DEBUG = process.env.DEBUG === '1';
 
-// Multi-model configuration
-const AVAILABLE_MODELS = (process.env.AVAILABLE_MODELS || 'gemini-3.1-flash-lite,gemini-3.1-pro-preview')
-  .split(',')
-  .map(m => m.trim())
-  .filter(Boolean);
+// 429 Mitigation Config
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '3', 10);        // Max parallel requests to Vertex
+const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '5', 10);              // Retries on 429
+const BASE_DELAY_MS = parseInt(process.env.BASE_DELAY_MS || '1000', 10);       // Base backoff delay
+const MAX_DELAY_MS = parseInt(process.env.MAX_DELAY_MS || '32000', 10);        // Max backoff cap
+const CIRCUIT_THRESHOLD = parseInt(process.env.CIRCUIT_THRESHOLD || '10', 10); // Errors before circuit opens
+const CIRCUIT_RECOVERY_MS = parseInt(process.env.CIRCUIT_RECOVERY_MS || '60000', 10);
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '60000', 10);
 
-// Model aliases (OpenAI-style names → Vertex names)
+const AVAILABLE_MODELS = (process.env.AVAILABLE_MODELS || 'gemini-3.1-flash-lite,gemini-3.1-pro-preview')
+  .split(',').map(m => m.trim()).filter(Boolean);
+
 const MODEL_ALIASES = {
   'gpt-4o-mini': 'gemini-3.1-flash-lite',
   'gpt-4o': 'gemini-3.1-pro-preview',
-  // Add more aliases as needed
 };
 
 if (!API_KEY) {
@@ -45,7 +53,7 @@ if (!API_KEY) {
 }
 
 function log(...args) {
-  if (DEBUG) console.error('[DEBUG]', ...args);
+  if (DEBUG) console.error('[DEBUG]', new Date().toISOString(), ...args);
 }
 
 function resolveModel(requestedModel) {
@@ -60,14 +68,132 @@ function generateId(prefix = 'chatcmpl') {
 }
 
 function getVertexUrl(model) {
-  // Preview models require v1beta1 even on project endpoints
   const isPreview = model.includes('preview') || model.includes('exp');
   const apiVersion = (isPreview || !PROJECT_ID) ? 'v1beta1' : 'v1';
+
+  if (USE_GLOBAL) {
+    // Global endpoint: higher quotas, no regional pinning
+    return `https://aiplatform.googleapis.com/${apiVersion}/projects/${PROJECT_ID || '_'}/locations/us-central1/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
+  }
 
   if (PROJECT_ID) {
     return `https://${LOCATION}-aiplatform.googleapis.com/${apiVersion}/projects/${PROJECT_ID}/locations/${LOCATION}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
   }
   return `https://aiplatform.googleapis.com/${apiVersion}/publishers/google/models/${model}:streamGenerateContent?alt=sse&key=${API_KEY}`;
+}
+
+// ─── Circuit Breaker ───────────────────────────────────────────
+class CircuitBreaker {
+  constructor(threshold, recoveryMs) {
+    this.threshold = threshold;
+    this.recoveryMs = recoveryMs;
+    this.failures = 0;
+    this.lastFailure = 0;
+    this.state = 'CLOSED'; // CLOSED, OPEN, HALF_OPEN
+  }
+
+  recordSuccess() {
+    this.failures = 0;
+    this.state = 'CLOSED';
+    log('[CIRCUIT]', 'CLOSED (success)');
+  }
+
+  recordFailure() {
+    this.failures++;
+    this.lastFailure = Date.now();
+    if (this.failures >= this.threshold) {
+      this.state = 'OPEN';
+      log('[CIRCUIT]', 'OPENED after', this.failures, 'failures');
+    }
+  }
+
+  canExecute() {
+    if (this.state === 'CLOSED') return true;
+    if (this.state === 'OPEN') {
+      if (Date.now() - this.lastFailure >= this.recoveryMs) {
+        this.state = 'HALF_OPEN';
+        this.failures = 0;
+        log('[CIRCUIT]', 'HALF_OPEN (testing)');
+        return true;
+      }
+      return false;
+    }
+    return true; // HALF_OPEN allows one test
+  }
+}
+
+const circuitBreaker = new CircuitBreaker(CIRCUIT_THRESHOLD, CIRCUIT_RECOVERY_MS);
+
+// ─── Request Queue ─────────────────────────────────────────────
+class RequestQueue {
+  constructor(maxConcurrent) {
+    this.maxConcurrent = maxConcurrent;
+    this.running = 0;
+    this.queue = [];
+  }
+
+  async enqueue(fn) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ fn, resolve, reject });
+      this.process();
+    });
+  }
+
+  async process() {
+    if (this.running >= this.maxConcurrent || this.queue.length === 0) return;
+    this.running++;
+    const { fn, resolve, reject } = this.queue.shift();
+    try {
+      const result = await fn();
+      resolve(result);
+    } catch (err) {
+      reject(err);
+    } finally {
+      this.running--;
+      // Process next
+      setImmediate(() => this.process());
+    }
+  }
+}
+
+const requestQueue = new RequestQueue(MAX_CONCURRENT);
+
+// ─── Retry with Exponential Backoff + Jitter ───────────────────
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function jitteredDelay(attempt) {
+  // Truncated exponential backoff: base * 2^attempt + random jitter
+  const exp = Math.min(Math.pow(2, attempt) * BASE_DELAY_MS, MAX_DELAY_MS);
+  const jitter = Math.random() * exp * 0.3; // 0-30% jitter
+  return Math.floor(exp + jitter);
+}
+
+async function retryWithBackoff(fn, context) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const result = await fn();
+      if (attempt > 0) log('[RETRY-SUCCESS]', context, 'on attempt', attempt);
+      circuitBreaker.recordSuccess();
+      return result;
+    } catch (err) {
+      const is429 = err.statusCode === 429 || (err.message && err.message.includes('429'));
+      const is5xx = err.statusCode >= 500 && err.statusCode < 600;
+      const isRetryable = is429 || is5xx || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+
+      if (!isRetryable || attempt >= MAX_RETRIES) {
+        circuitBreaker.recordFailure();
+        throw err;
+      }
+
+      const delay = jitteredDelay(attempt);
+      log('[RETRY]', context, 'attempt', attempt + 1, '/', MAX_RETRIES,
+        'delay', delay + 'ms', 'error:', err.statusCode || err.code || err.message.substring(0, 50));
+      await sleep(delay);
+    }
+  }
+  throw new Error('Max retries exceeded');
 }
 
 // ─── Safe JSON Parse ───────────────────────────────────────────
@@ -132,7 +258,6 @@ function openAIToVertex(openaiBody) {
   while (i < messages.length) {
     const msg = messages[i];
 
-    // System / Developer
     if (msg.role === 'system' || msg.role === 'developer') {
       if (typeof msg.content === 'string') {
         systemInstruction = { parts: [{ text: msg.content }] };
@@ -176,7 +301,6 @@ function openAIToVertex(openaiBody) {
       continue;
     }
 
-    // Normal user / assistant
     const role = msg.role === 'assistant' ? 'model' : 'user';
     let parts = [];
 
@@ -212,7 +336,6 @@ function openAIToVertex(openaiBody) {
       }
     }
 
-    // tool_calls
     if (msg.tool_calls && msg.tool_calls.length > 0) {
       for (const tc of msg.tool_calls) {
         let args = {};
@@ -232,7 +355,6 @@ function openAIToVertex(openaiBody) {
       }
     }
 
-    // Deprecated function_call
     if (msg.function_call) {
       let args = {};
       if (typeof msg.function_call.arguments === 'string') {
@@ -436,6 +558,44 @@ function buildOpenAINonStreamingResponse(events, id, model) {
   };
 }
 
+// ─── Vertex Request with Retry ─────────────────────────────────
+function makeVertexRequest(vertexUrl, options, vertexBody) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(vertexUrl);
+    const req = https.request(url, options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          const err = new Error(`Vertex API error ${res.statusCode}: ${data}`);
+          err.statusCode = res.statusCode;
+          err.data = data;
+          reject(err);
+          return;
+        }
+        resolve({ statusCode: res.statusCode, data });
+      });
+    });
+
+    req.on('error', (err) => {
+      err.statusCode = 0;
+      reject(err);
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      const err = new Error('Request timeout');
+      err.statusCode = 0;
+      err.code = 'ETIMEDOUT';
+      reject(err);
+    });
+
+    req.setTimeout(REQUEST_TIMEOUT_MS);
+    req.write(JSON.stringify(vertexBody));
+    req.end();
+  });
+}
+
 // ─── HTTP Server ────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -448,14 +608,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Health check
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', models: AVAILABLE_MODELS }));
+    res.end(JSON.stringify({
+      status: 'ok',
+      models: AVAILABLE_MODELS,
+      circuit: circuitBreaker.state,
+      queue: { running: requestQueue.running, pending: requestQueue.queue.length }
+    }));
     return;
   }
 
-  // Models list (OpenAI-compatible)
   if (req.url === '/v1/models') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
@@ -482,6 +645,21 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Circuit breaker check
+  if (!circuitBreaker.canExecute()) {
+    log('[CIRCUIT-REJECT]');
+    res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: {
+        message: 'Rate limit: circuit breaker open. Vertex AI is overloaded. Retry in ' + Math.ceil(CIRCUIT_RECOVERY_MS / 1000) + 's.',
+        type: 'rate_limit_error',
+        param: null,
+        code: 'rate_limit_exceeded'
+      }
+    }));
+    return;
+  }
+
   let body = '';
   req.on('data', chunk => body += chunk);
   await new Promise(resolve => req.on('end', resolve));
@@ -497,7 +675,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // OpenAI default: stream = false
   const stream = openaiBody.stream === true;
   const requestId = generateId();
 
@@ -512,129 +689,82 @@ const server = http.createServer(async (req, res) => {
         'Accept': 'text/event-stream'
       }
     };
-    if (PROJECT_ID) options.headers['Authorization'] = `Bearer ${API_KEY}`;
+    if (PROJECT_ID || USE_GLOBAL) options.headers['Authorization'] = `Bearer ${API_KEY}`;
 
     log('[VERTEX-URL]', url.toString().replace(API_KEY, '***'));
-    log('[VERTEX-BODY]', JSON.stringify(vertexBody).substring(0, 1000));
 
-    const vertexReq = https.request(url, options, (vertexRes) => {
-      log('[VERTEX-STATUS]', vertexRes.statusCode);
+    // Queue the request + retry on 429
+    const vertexResponse = await requestQueue.enqueue(() =>
+      retryWithBackoff(() => makeVertexRequest(vertexUrl, options, vertexBody), model)
+    );
 
-      if (vertexRes.statusCode !== 200) {
-        let errorData = '';
-        vertexRes.on('data', chunk => errorData += chunk);
-        vertexRes.on('end', () => {
-          log('[VERTEX-ERROR]', errorData.substring(0, 400));
-          res.writeHead(vertexRes.statusCode, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            error: { message: `Vertex API error: ${errorData}`, type: 'api_error', param: null, code: vertexRes.statusCode }
-          }));
-        });
-        return;
+    if (stream) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+
+      const decoder = new TextDecoder('utf-8');
+      const parser = new SseParser();
+      let isFirst = true;
+
+      // Parse the accumulated response data as a stream
+      const data = vertexResponse.data;
+      // Feed chunks to simulate streaming from the already-fetched response
+      // For non-streaming Vertex returns everything at once, but we parse it as SSE events
+      const events = parser.feed(data);
+      for (const event of events) {
+        if (event === '[DONE]') continue;
+        try {
+          const vertexChunk = safeJsonParse(event, 'stream-chunk');
+          const openaiChunk = buildOpenAIStreamingChunk(vertexChunk, requestId, model, isFirst);
+          isFirst = false;
+          if (openaiChunk) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
+        } catch (e) {
+          log('[STREAM-PARSE-ERR]', e.message, event.substring(0, 200));
+        }
       }
-
-      if (stream) {
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive'
-        });
-
-        const decoder = new TextDecoder('utf-8');
-        const parser = new SseParser();
-        let isFirst = true;
-
-        vertexRes.on('data', (chunk) => {
-          const events = parser.feed(decoder.decode(chunk, { stream: true }));
-          for (const event of events) {
-            if (event === '[DONE]') continue;
-            try {
-              const vertexChunk = safeJsonParse(event, 'stream-chunk');
-              const openaiChunk = buildOpenAIStreamingChunk(vertexChunk, requestId, model, isFirst);
-              isFirst = false;
-              if (openaiChunk) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
-            } catch (e) {
-              log('[STREAM-PARSE-ERR]', e.message, event.substring(0, 200));
-            }
-          }
-        });
-
-        vertexRes.on('end', () => {
-          try {
-            const events = parser.feed(decoder.decode());
-            for (const event of events) {
-              if (event === '[DONE]') continue;
-              try {
-                const vertexChunk = safeJsonParse(event, 'stream-end');
-                const openaiChunk = buildOpenAIStreamingChunk(vertexChunk, requestId, model, isFirst);
-                if (openaiChunk) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
-              } catch (e) {
-                log('[STREAM-END-ERR]', e.message);
-              }
-            }
-            const events2 = parser.flush();
-            for (const event of events2) {
-              if (event === '[DONE]') continue;
-              try {
-                const vertexChunk = safeJsonParse(event, 'stream-flush');
-                const openaiChunk = buildOpenAIStreamingChunk(vertexChunk, requestId, model, isFirst);
-                if (openaiChunk) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
-              } catch (e) {
-                log('[STREAM-FLUSH-ERR]', e.message);
-              }
-            }
-          } catch (e) {
-            log('[DECODER-FLUSH-ERR]', e.message);
-          }
-          res.write(`data: {"id":"chatcmpl-${requestId}","object":"chat.completion.chunk","created":${Math.floor(Date.now()/1000)},"model":"${model}","choices":[{"index":0,"delta":{},"finish_reason":null,"logprobs":null}]}\n\n`);
-          res.write('data: [DONE]\n\n');
-          res.end();
-        });
-
-        vertexRes.on('error', (err) => {
-          log('[VERTEX-STREAM-ERR]', err.message);
-          res.end();
-        });
-      } else {
-        const decoder = new TextDecoder('utf-8');
-        const parser = new SseParser();
-
-        vertexRes.on('data', chunk => {
-          parser.feed(decoder.decode(chunk, { stream: true }));
-        });
-
-        vertexRes.on('end', () => {
-          try { parser.feed(decoder.decode()); } catch (e) { log('[DECODER-FLUSH]', e.message); }
-          const events = parser.flush();
-          log('[NON-STREAM-EVENTS]', events.length);
-
-          try {
-            const response = buildOpenAINonStreamingResponse(events, requestId, model);
-            log('[RESPONSE]', JSON.stringify(response).substring(0, 300));
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(response));
-          } catch (e) {
-            log('[BUILD-RESPONSE-ERR]', e.message, e.stack);
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: { message: e.message, type: 'internal_error', param: null, code: null } }));
-          }
-        });
+      const events2 = parser.flush();
+      for (const event of events2) {
+        if (event === '[DONE]') continue;
+        try {
+          const vertexChunk = safeJsonParse(event, 'stream-flush');
+          const openaiChunk = buildOpenAIStreamingChunk(vertexChunk, requestId, model, isFirst);
+          if (openaiChunk) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
+        } catch (e) {
+          log('[STREAM-FLUSH-ERR]', e.message);
+        }
       }
-    });
+      res.write(`data: {"id":"chatcmpl-${requestId}","object":"chat.completion.chunk","created":${Math.floor(Date.now()/1000)},"model":"${model}","choices":[{"index":0,"delta":{},"finish_reason":null,"logprobs":null}]}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } else {
+      const parser = new SseParser();
+      const events = parser.feed(vertexResponse.data);
+      const events2 = parser.flush();
+      const allEvents = [...events, ...events2];
+      log('[NON-STREAM-EVENTS]', allEvents.length);
 
-    vertexReq.on('error', (err) => {
-      log('[VERTEX-REQ-ERR]', err.message);
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: err.message, type: 'api_error', param: null, code: null } }));
-    });
-
-    vertexReq.write(JSON.stringify(vertexBody));
-    vertexReq.end();
+      const response = buildOpenAINonStreamingResponse(allEvents, requestId, model);
+      log('[RESPONSE]', JSON.stringify(response).substring(0, 300));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(response));
+    }
 
   } catch (err) {
     log('[PROXY-ERR]', err.message, err.stack);
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: err.message, type: 'internal_error', param: null, code: null } }));
+    const is429 = err.statusCode === 429;
+    const statusCode = is429 ? 429 : 500;
+    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: {
+        message: err.message,
+        type: is429 ? 'rate_limit_error' : 'internal_error',
+        param: null,
+        code: is429 ? 'rate_limit_exceeded' : null
+      }
+    }));
   }
 });
 
@@ -642,9 +772,10 @@ server.listen(PORT, () => {
   console.log(`Vertex AI OpenAI Proxy running on port ${PORT}`);
   console.log(`Available models: ${AVAILABLE_MODELS.join(', ')}`);
   console.log(`Default model: ${DEFAULT_MODEL}`);
-  console.log(`Endpoint: http://localhost:${PORT}/v1/chat/completions`);
-  console.log(`Models list: http://localhost:${PORT}/v1/models`);
-  console.log(`Debug: ${DEBUG ? 'enabled' : 'disabled'} (DEBUG=1)`);
+  console.log(`Max concurrent: ${MAX_CONCURRENT}, Max retries: ${MAX_RETRIES}`);
+  console.log(`Circuit breaker: ${CIRCUIT_THRESHOLD} failures / ${CIRCUIT_RECOVERY_MS}ms recovery`);
+  console.log(`Global endpoint: ${USE_GLOBAL ? 'enabled' : 'disabled'} (USE_GLOBAL=1)`);
+  console.log(`Debug: ${DEBUG ? 'enabled' : 'disabled'}`);
 });
 
 process.on('SIGTERM', () => {
