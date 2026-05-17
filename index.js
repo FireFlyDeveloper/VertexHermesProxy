@@ -1,14 +1,18 @@
 #!/usr/bin/env node
 /**
- * Vertex AI → OpenAI Compatible Proxy (v3 - Tool Grouping Fix)
+ * Vertex AI → OpenAI Compatible Proxy (v4 - Multi-Model Support)
+ *
+ * Supported models:
+ *   - gemini-3.1-flash-lite
+ *   - gemini-3.1-pro-preview
  *
  * Critical fixes:
  *  1. Group consecutive role="tool" messages into ONE Vertex user turn
- *     (Vertex requires: #functionResponse parts == #functionCall parts)
- *  2. functionResponse.response = raw object, NOT wrapped in {result: ...}
- *  3. Spec-compliant SSE parser (handles \r\n, multi-line data)
+ *  2. functionResponse.response = raw object (not wrapped in {result:...})
+ *  3. Spec-compliant SSE parser
  *  4. stream default = false (OpenAI spec)
  *  5. thought_signature bidirectional pass-through
+ *  6. Multi-model support with /v1/models listing
  */
 const http = require('http');
 const https = require('https');
@@ -22,6 +26,19 @@ const LOCATION = process.env.GOOGLE_LOCATION || 'us-central1';
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'gemini-3.1-flash-lite';
 const DEBUG = process.env.DEBUG === '1';
 
+// Multi-model configuration
+const AVAILABLE_MODELS = (process.env.AVAILABLE_MODELS || 'gemini-3.1-flash-lite,gemini-3.1-pro-preview')
+  .split(',')
+  .map(m => m.trim())
+  .filter(Boolean);
+
+// Model aliases (OpenAI-style names → Vertex names)
+const MODEL_ALIASES = {
+  'gpt-4o-mini': 'gemini-3.1-flash-lite',
+  'gpt-4o': 'gemini-3.1-pro-preview',
+  // Add more aliases as needed
+};
+
 if (!API_KEY) {
   console.error('[FATAL] GOOGLE_API_KEY required');
   process.exit(1);
@@ -31,15 +48,26 @@ function log(...args) {
   if (DEBUG) console.error('[DEBUG]', ...args);
 }
 
+function resolveModel(requestedModel) {
+  const alias = MODEL_ALIASES[requestedModel];
+  if (alias) return alias;
+  if (AVAILABLE_MODELS.includes(requestedModel)) return requestedModel;
+  return DEFAULT_MODEL;
+}
+
 function generateId(prefix = 'chatcmpl') {
   return `${prefix}-${Date.now().toString(16)}${Math.random().toString(36).substring(2, 10)}`;
 }
 
 function getVertexUrl(model) {
+  // Preview models require v1beta1 even on project endpoints
+  const isPreview = model.includes('preview') || model.includes('exp');
+  const apiVersion = (isPreview || !PROJECT_ID) ? 'v1beta1' : 'v1';
+
   if (PROJECT_ID) {
-    return `https://${LOCATION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${LOCATION}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
+    return `https://${LOCATION}-aiplatform.googleapis.com/${apiVersion}/projects/${PROJECT_ID}/locations/${LOCATION}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
   }
-  return `https://aiplatform.googleapis.com/v1beta1/publishers/google/models/${model}:streamGenerateContent?alt=sse&key=${API_KEY}`;
+  return `https://aiplatform.googleapis.com/${apiVersion}/publishers/google/models/${model}:streamGenerateContent?alt=sse&key=${API_KEY}`;
 }
 
 // ─── Safe JSON Parse ───────────────────────────────────────────
@@ -52,7 +80,7 @@ function safeJsonParse(str, ctx) {
   }
 }
 
-// ─── SSE Parser (spec-compliant: splits on \r\n\r\n / \n\n) ─────
+// ─── SSE Parser ────────────────────────────────────────────────
 class SseParser {
   constructor() {
     this.buffer = '';
@@ -60,7 +88,6 @@ class SseParser {
   feed(text) {
     this.buffer += text;
     const events = [];
-    // SSE events separated by blank lines
     const parts = this.buffer.split(/(?:\r?\n){2,}/);
     this.buffer = parts.pop() || '';
     for (const part of parts) {
@@ -93,7 +120,10 @@ class SseParser {
 
 // ─── OpenAI → Vertex Request Translator ────────────────────────
 function openAIToVertex(openaiBody) {
-  const model = openaiBody.model || DEFAULT_MODEL;
+  const requestedModel = openaiBody.model || DEFAULT_MODEL;
+  const model = resolveModel(requestedModel);
+  log('[MODEL]', 'requested:', requestedModel, '→ resolved:', model);
+
   const contents = [];
   let systemInstruction = null;
   const messages = openaiBody.messages || [];
@@ -102,7 +132,7 @@ function openAIToVertex(openaiBody) {
   while (i < messages.length) {
     const msg = messages[i];
 
-    // ── System / Developer messages ────────────────────────────
+    // System / Developer
     if (msg.role === 'system' || msg.role === 'developer') {
       if (typeof msg.content === 'string') {
         systemInstruction = { parts: [{ text: msg.content }] };
@@ -111,8 +141,7 @@ function openAIToVertex(openaiBody) {
       continue;
     }
 
-    // ── Group consecutive tool/function responses ──────────────
-    // CRITICAL: Vertex requires ALL function responses in ONE user turn
+    // Group consecutive tool/function responses
     if (msg.role === 'tool' || msg.role === 'function') {
       const toolGroup = [];
       while (i < messages.length && (messages[i].role === 'tool' || messages[i].role === 'function')) {
@@ -126,7 +155,6 @@ function openAIToVertex(openaiBody) {
           try {
             responseData = JSON.parse(t.content);
           } catch {
-            // Plain text → wrap in object (Vertex requires object)
             responseData = { result: t.content };
           }
         } else if (t.content !== null && typeof t.content === 'object') {
@@ -143,16 +171,15 @@ function openAIToVertex(openaiBody) {
         };
       });
 
-      log('[TOOL-GROUP]', toolGroup.length, 'tools grouped into 1 turn');
+      log('[TOOL-GROUP]', toolGroup.length, 'tools → 1 turn');
       contents.push({ role: 'user', parts });
       continue;
     }
 
-    // ── Normal user / assistant messages ───────────────────────
+    // Normal user / assistant
     const role = msg.role === 'assistant' ? 'model' : 'user';
     let parts = [];
 
-    // Content parsing
     if (typeof msg.content === 'string') {
       parts.push({ text: msg.content });
     } else if (Array.isArray(msg.content)) {
@@ -185,7 +212,7 @@ function openAIToVertex(openaiBody) {
       }
     }
 
-    // tool_calls (assistant → model function calls)
+    // tool_calls
     if (msg.tool_calls && msg.tool_calls.length > 0) {
       for (const tc of msg.tool_calls) {
         let args = {};
@@ -197,7 +224,6 @@ function openAIToVertex(openaiBody) {
           }
         }
         const fcPart = { functionCall: { name: tc.function?.name || 'unknown', args } };
-        // Pass thought_signature back (critical for Gemini 3.x)
         const sig = tc.extra_content?.google?.thought_signature
                  || tc.thoughtSignature
                  || tc.thought_signature;
@@ -223,7 +249,6 @@ function openAIToVertex(openaiBody) {
     i++;
   }
 
-  // ── Generation Config ────────────────────────────────────────
   const generationConfig = {
     temperature: openaiBody.temperature ?? 1,
     maxOutputTokens: openaiBody.max_tokens || 65535,
@@ -236,7 +261,6 @@ function openAIToVertex(openaiBody) {
     if (generationConfig[k] === undefined) delete generationConfig[k];
   });
 
-  // ── Tools / Functions ────────────────────────────────────────
   let tools = null;
   let toolConfig = null;
 
@@ -285,7 +309,7 @@ function openAIToVertex(openaiBody) {
   if (tools) vertexBody.tools = tools;
   if (toolConfig) vertexBody.toolConfig = toolConfig;
 
-  log('[VERTEX-CONTENTS-COUNT]', contents.length);
+  log('[VERTEX-CONTENTS]', contents.length, 'turns');
   contents.forEach((c, idx) => {
     log(`  [${idx}] role=${c.role} parts=${c.parts.length}`,
       c.parts.map(p => Object.keys(p).join(',')).join(' | '));
@@ -424,16 +448,24 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.url === '/health' || req.url === '/v1/models') {
+  // Health check
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', models: AVAILABLE_MODELS }));
+    return;
+  }
+
+  // Models list (OpenAI-compatible)
+  if (req.url === '/v1/models') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       object: 'list',
-      data: [{
-        id: DEFAULT_MODEL,
+      data: AVAILABLE_MODELS.map(m => ({
+        id: m,
         object: 'model',
         created: Math.floor(Date.now() / 1000),
         owned_by: 'google'
-      }]
+      }))
     }));
     return;
   }
@@ -608,8 +640,10 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Vertex AI OpenAI Proxy running on port ${PORT}`);
+  console.log(`Available models: ${AVAILABLE_MODELS.join(', ')}`);
   console.log(`Default model: ${DEFAULT_MODEL}`);
   console.log(`Endpoint: http://localhost:${PORT}/v1/chat/completions`);
+  console.log(`Models list: http://localhost:${PORT}/v1/models`);
   console.log(`Debug: ${DEBUG ? 'enabled' : 'disabled'} (DEBUG=1)`);
 });
 
