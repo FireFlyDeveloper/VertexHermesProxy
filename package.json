@@ -1,0 +1,26 @@
+{
+  "name": "vertexhermesproxy",
+  "version": "1.0.0",
+  "description": "A proxy service for Vertex/Hermes integrations.",
+  "main": "index.js",
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {},
+  "scripts": {
+    "start": "bun index.js",
+    "dev": "DEBUG=1 node index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FireFlyDeveloper/VertexHermesProxy.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/FireFlyDeveloper/VertexHermesProxy/issues"
+  },
+  "homepage": "https://github.com/FireFlyDeveloper/VertexHermesProxy#readme"
+}
