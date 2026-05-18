@@ -1,21 +1,12 @@
 #!/usr/bin/env node
 /**
- * Vertex AI → OpenAI Compatible Proxy (v7 - Built-in OAuth + Refresh Token)
+ * Vertex AI → OpenAI Compatible Proxy (v9 - Streaming Fix + Per-Model Rate Limit)
  *
- * Auth modes (priority order):
- *   1. Client-provided Bearer token (pass-through from Hermes)
- *   2. Service Account JSON (auto-refresh JWT)
- *   3. OAuth 2.0 Refresh Token (auto-refresh access token)
- *   4. Static Access Token (no refresh)
- *   5. API Key (legacy, non-OAuth endpoints only)
- *
- * Built-in OAuth flow:
- *   GET /auth/start → opens browser, returns refresh token
- *   (Run once on your desktop, then copy refresh token to env)
- *
- * Endpoint modes:
- *   A. OpenAI-native: /endpoints/openapi/chat/completions (RECOMMENDED)
- *   B. Legacy Gemini: /models/{model}:streamGenerateContent
+ * Fixes:
+ *  - Proper streaming: stream responses are piped directly, not buffered
+ *  - Per-model rate limit tracking: remembers which models are 429-ing
+ *  - Better error detection: catches non-JSON in stream bodies
+ *  - DeepSeek uses publisher endpoint (not openapi) for better compatibility
  */
 const http = require('http');
 const https = require('https');
@@ -27,7 +18,6 @@ const { exec } = require('child_process');
 const PORT = process.env.PORT || 3000;
 const DEBUG = process.env.DEBUG === '1';
 
-// Auth (priority: service_account > refresh_token > access_token > api_key)
 const API_KEY = process.env.GOOGLE_API_KEY || '';
 const ACCESS_TOKEN = process.env.GOOGLE_ACCESS_TOKEN || '';
 const REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || '';
@@ -35,25 +25,12 @@ const OAUTH_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const OAUTH_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
 const SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '';
 
-// OAuth web server (for built-in flow)
 const OAUTH_REDIRECT_PORT = parseInt(process.env.OAUTH_REDIRECT_PORT || '8085', 10);
-
-// Endpoint
-const USE_OPENAI_ENDPOINT = process.env.USE_OPENAI_ENDPOINT !== '0';
 const PROJECT_ID = process.env.GOOGLE_PROJECT_ID || '';
 const LOCATION = process.env.GOOGLE_LOCATION || 'global';
 const ENDPOINT = process.env.ENDPOINT || 'aiplatform.googleapis.com';
-
-// Models
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'gemini-3.1-flash-lite';
-const AVAILABLE_MODELS = (process.env.AVAILABLE_MODELS || 'gemini-3.1-flash-lite,gemini-3.1-pro-preview,moonshotai/kimi-k2-thinking-maas')
-  .split(',').map(m => m.trim()).filter(Boolean);
-const MODEL_ALIASES = {
-  'gpt-4o-mini': 'gemini-3.1-flash-lite',
-  'gpt-4o': 'gemini-3.1-pro-preview',
-};
 
-// 429 Mitigation
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '3', 10);
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '5', 10);
 const BASE_DELAY_MS = parseInt(process.env.BASE_DELAY_MS || '1000', 10);
@@ -62,12 +39,26 @@ const CIRCUIT_THRESHOLD = parseInt(process.env.CIRCUIT_THRESHOLD || '10', 10);
 const CIRCUIT_RECOVERY_MS = parseInt(process.env.CIRCUIT_RECOVERY_MS || '60000', 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '120000', 10);
 
+// ─── Model Registry ────────────────────────────────────────────
+const MODEL_REGISTRY = {
+  'gemini-3.1-flash-lite': { provider: 'google', endpoint: 'openai', location: 'global' },
+  'gemini-3.1-pro-preview': { provider: 'google', endpoint: 'openai', location: 'global' },
+  'moonshotai/kimi-k2-thinking-maas': { provider: 'moonshot', endpoint: 'openai', location: 'global' },
+  'deepseek-ai/deepseek-v3.2-maas': { provider: 'deepseek', endpoint: 'publisher', location: 'global' },
+  'deepseek-ai/deepseek-r1-0528-maas': { provider: 'deepseek', endpoint: 'publisher', location: 'us-central1' },
+  'claude-haiku-4-5': { provider: 'anthropic', endpoint: 'anthropic', location: 'global' },
+  'claude-sonnet-4-6': { provider: 'anthropic', endpoint: 'anthropic', location: 'global' },
+};
+
+const MODEL_ALIASES = {
+  'gpt-4o-mini': 'gemini-3.1-flash-lite',
+  'gpt-4o': 'gemini-3.1-pro-preview',
+};
+
+const AVAILABLE_MODELS = Object.keys(MODEL_REGISTRY);
+
 if (!API_KEY && !ACCESS_TOKEN && !REFRESH_TOKEN && !SERVICE_ACCOUNT_JSON) {
-  console.error('[FATAL] No auth configured. Set one of:');
-  console.error('  GOOGLE_SERVICE_ACCOUNT_JSON (recommended for servers)');
-  console.error('  GOOGLE_REFRESH_TOKEN + GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET');
-  console.error('  GOOGLE_ACCESS_TOKEN (short-lived)');
-  console.error('  GOOGLE_API_KEY (legacy)');
+  console.error('[FATAL] No auth configured');
   process.exit(1);
 }
 
@@ -83,7 +74,7 @@ if (SERVICE_ACCOUNT_JSON) {
   try {
     serviceAccount = JSON.parse(SERVICE_ACCOUNT_JSON);
     if (!serviceAccount.private_key || serviceAccount.private_key.trim() === '') {
-      console.error('[WARN] GOOGLE_SERVICE_ACCOUNT_JSON has empty private_key - service account auth disabled');
+      console.error('[WARN] Empty private_key - service account disabled');
       serviceAccount = null;
     } else {
       log('[AUTH]', 'Service account:', serviceAccount.client_email);
@@ -108,9 +99,8 @@ function signJWT(header, payload, privateKey) {
 async function getOAuthTokenFromServiceAccount() {
   if (!serviceAccount) return null;
   const now = Math.floor(Date.now() / 1000);
-  if (cachedToken.token && cachedToken.expiry > now + 60) {
-    return cachedToken.token;
-  }
+  if (cachedToken.token && cachedToken.expiry > now + 60) return cachedToken.token;
+
   const header = base64UrlEncode(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
   const claim = base64UrlEncode(JSON.stringify({
     iss: serviceAccount.client_email,
@@ -149,7 +139,6 @@ async function getOAuthTokenFromServiceAccount() {
   });
 }
 
-// ─── OAuth Refresh Token ───────────────────────────────────────
 async function refreshAccessToken() {
   if (!REFRESH_TOKEN || !OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
     throw new Error('Missing refresh token or OAuth client credentials');
@@ -173,7 +162,7 @@ async function refreshAccessToken() {
           const json = JSON.parse(data);
           if (json.access_token) {
             cachedToken = { token: json.access_token, expiry: Math.floor(Date.now() / 1000) + (json.expires_in || 3600) };
-            log('[AUTH]', 'Refresh token exchanged, expires in', json.expires_in || 3600);
+            log('[AUTH]', 'Refresh token exchanged');
             resolve(json.access_token);
           } else {
             reject(new Error(`Token refresh failed: ${data}`));
@@ -187,23 +176,11 @@ async function refreshAccessToken() {
   });
 }
 
-async function getAuthToken(clientBearerToken) {
-  // NOTE: We do NOT pass through client Bearer tokens.
-  // Hermes may send dummy keys ("sk-test", "dummy-key") or its own API keys
-  // that are NOT valid Google OAuth 2.0 access tokens. Vertex requires
-  // a real Google-issued OAuth token. Always use the proxy's configured auth.
-
-  // Priority 1: Service account (auto-refresh JWT)
+async function getAuthToken() {
   if (serviceAccount) {
-    try {
-      const token = await getOAuthTokenFromServiceAccount();
-      if (token) return token;
-    } catch (err) {
-      log('[AUTH]', 'Service account failed:', err.message, '- trying fallback auth');
-    }
+    try { const token = await getOAuthTokenFromServiceAccount(); if (token) return token; }
+    catch (err) { log('[AUTH]', 'Service account failed:', err.message); }
   }
-
-  // Priority 2: OAuth refresh token (auto-refresh access token)
   if (REFRESH_TOKEN && OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET) {
     try {
       const now = Math.floor(Date.now() / 1000);
@@ -212,18 +189,9 @@ async function getAuthToken(clientBearerToken) {
         return cachedToken.token;
       }
       return await refreshAccessToken();
-    } catch (err) {
-      log('[AUTH]', 'Refresh token failed:', err.message, '- trying fallback auth');
-    }
+    } catch (err) { log('[AUTH]', 'Refresh token failed:', err.message); }
   }
-
-  // Priority 3: Static access token (no refresh)
-  if (ACCESS_TOKEN) {
-    log('[AUTH]', 'Static access token');
-    return ACCESS_TOKEN;
-  }
-
-  // Priority 4: API key (legacy, only for non-OAuth endpoints)
+  if (ACCESS_TOKEN) { log('[AUTH]', 'Static access token'); return ACCESS_TOKEN; }
   return null;
 }
 
@@ -231,24 +199,57 @@ async function getAuthToken(clientBearerToken) {
 function resolveModel(requestedModel) {
   const alias = MODEL_ALIASES[requestedModel];
   if (alias) return alias;
-  if (AVAILABLE_MODELS.includes(requestedModel)) return requestedModel;
+  if (MODEL_REGISTRY[requestedModel]) return requestedModel;
   return DEFAULT_MODEL;
 }
+
+function getModelInfo(model) {
+  return MODEL_REGISTRY[model] || MODEL_REGISTRY[DEFAULT_MODEL] || {
+    provider: 'google', endpoint: 'openai', location: 'global'
+  };
+}
+
 function generateId(prefix = 'chatcmpl') {
   return `${prefix}-${Date.now().toString(16)}${Math.random().toString(36).substring(2, 10)}`;
 }
-function getVertexUrl(model, openaiMode) {
-  const apiVersion = 'v1beta1';
-  if (openaiMode) {
-    if (model.includes('/')) {
-      return `https://${ENDPOINT}/${apiVersion}/projects/${PROJECT_ID}/locations/${LOCATION}/endpoints/openapi/chat/completions`;
-    }
-    return `https://${ENDPOINT}/${apiVersion}/projects/${PROJECT_ID}/locations/${LOCATION}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
+
+function getVertexUrl(model, info) {
+  const apiVersion = info.endpoint === 'anthropic' ? 'v1' : 'v1beta1';
+  const endpoint = info.location === 'us-central1' ? 'us-central1-aiplatform.googleapis.com' : ENDPOINT;
+
+  if (info.endpoint === 'openai') {
+    return `https://${endpoint}/${apiVersion}/projects/${PROJECT_ID}/locations/${info.location}/endpoints/openapi/chat/completions`;
   }
+  if (info.endpoint === 'publisher') {
+    // DeepSeek uses publisher endpoint with model in URL
+    return `https://${endpoint}/${apiVersion}/projects/${PROJECT_ID}/locations/${info.location}/publishers/deepseek/models/${model}:streamRawPredict`;
+  }
+  if (info.endpoint === 'anthropic') {
+    return `https://${endpoint}/${apiVersion}/projects/${PROJECT_ID}/locations/${info.location}/publishers/anthropic/models/${model}:streamRawPredict`;
+  }
+  // Legacy Gemini
   if (PROJECT_ID) {
-    return `https://${LOCATION}-aiplatform.googleapis.com/${apiVersion}/projects/${PROJECT_ID}/locations/${LOCATION}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
+    return `https://${info.location}-aiplatform.googleapis.com/${apiVersion}/projects/${PROJECT_ID}/locations/${info.location}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
   }
   return `https://aiplatform.googleapis.com/${apiVersion}/publishers/google/models/${model}:streamGenerateContent?alt=sse&key=${API_KEY}`;
+}
+
+// ─── Per-Model Rate Limit Tracker ──────────────────────────────
+const modelRateLimits = new Map();
+
+function isModelRateLimited(model) {
+  const entry = modelRateLimits.get(model);
+  if (!entry) return false;
+  if (Date.now() > entry.resetAt) {
+    modelRateLimits.delete(model);
+    return false;
+  }
+  return true;
+}
+
+function recordModelRateLimit(model, retryAfterMs = 30000) {
+  modelRateLimits.set(model, { resetAt: Date.now() + retryAfterMs });
+  log('[RATE-LIMIT]', model, 'blocked for', retryAfterMs, 'ms');
 }
 
 // ─── Circuit Breaker ───────────────────────────────────────────
@@ -297,16 +298,32 @@ function jitteredDelay(attempt) {
   const exp = Math.min(Math.pow(2, attempt) * BASE_DELAY_MS, MAX_DELAY_MS);
   return Math.floor(exp + Math.random() * exp * 0.3);
 }
-async function retryWithBackoff(fn, context) {
+async function retryWithBackoff(fn, context, model) {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    // Check per-model rate limit before attempting
+    if (isModelRateLimited(model)) {
+      const entry = modelRateLimits.get(model);
+      const waitMs = entry.resetAt - Date.now();
+      log('[RATE-LIMIT-WAIT]', model, 'waiting', waitMs, 'ms');
+      await sleep(waitMs);
+    }
+
     try {
       const result = await fn();
       if (attempt > 0) log('[RETRY-OK]', context, attempt);
       circuitBreaker.recordSuccess();
       return result;
     } catch (err) {
-      const isRetryable = err.statusCode === 429 || (err.statusCode >= 500 && err.statusCode < 600)
-        || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+      const is429 = err.statusCode === 429;
+      const is5xx = err.statusCode >= 500 && err.statusCode < 600;
+      const isRetryable = is429 || is5xx || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+
+      if (is429) {
+        // Extract retry-after if available
+        const retryAfter = err.retryAfter || 30000;
+        recordModelRateLimit(model, retryAfter);
+      }
+
       if (!isRetryable || attempt >= MAX_RETRIES) { circuitBreaker.recordFailure(); throw err; }
       const delay = jitteredDelay(attempt);
       log('[RETRY]', context, attempt + 1 + '/' + MAX_RETRIES, delay + 'ms', err.statusCode || err.code);
@@ -319,7 +336,12 @@ async function retryWithBackoff(fn, context) {
 // ─── Safe JSON Parse ───────────────────────────────────────────
 function safeJsonParse(str, ctx) {
   try { return JSON.parse(str); }
-  catch (e) { log('[JSON-FAIL]', ctx, str.substring(0, 200), e.message); throw new Error(`JSON parse failed (${ctx}): ${e.message}`); }
+  catch (e) {
+    // Don't log huge error HTML pages
+    const preview = str.substring(0, 100).replace(/\s+/g, ' ');
+    log('[JSON-FAIL]', ctx, preview, '...');
+    throw new Error(`JSON parse failed (${ctx}): ${e.message}`);
+  }
 }
 
 // ─── SSE Parser ────────────────────────────────────────────────
@@ -352,12 +374,9 @@ class SseParser {
   }
 }
 
-// ─── OpenAI → Vertex (Legacy) ──────────────────────────────────
-function openAIToVertex(openaiBody) {
-  const requestedModel = openaiBody.model || DEFAULT_MODEL;
-  const model = resolveModel(requestedModel);
-  log('[MODEL]', requestedModel, '→', model);
+// ─── Request Builders ──────────────────────────────────────────
 
+function buildGeminiBody(openaiBody) {
   const contents = [];
   let systemInstruction = null;
   const messages = openaiBody.messages || [];
@@ -365,12 +384,10 @@ function openAIToVertex(openaiBody) {
 
   while (i < messages.length) {
     const msg = messages[i];
-
     if (msg.role === 'system' || msg.role === 'developer') {
       if (typeof msg.content === 'string') systemInstruction = { parts: [{ text: msg.content }] };
       i++; continue;
     }
-
     if (msg.role === 'tool' || msg.role === 'function') {
       const toolGroup = [];
       while (i < messages.length && (messages[i].role === 'tool' || messages[i].role === 'function')) {
@@ -387,14 +404,11 @@ function openAIToVertex(openaiBody) {
         }
         return { functionResponse: { name: t.name || t.function?.name || 'unknown', response: responseData } };
       });
-      log('[TOOL-GROUP]', toolGroup.length, '→ 1 turn');
       contents.push({ role: 'user', parts });
       continue;
     }
-
     const role = msg.role === 'assistant' ? 'model' : 'user';
     let parts = [];
-
     if (typeof msg.content === 'string') {
       parts.push({ text: msg.content });
     } else if (Array.isArray(msg.content)) {
@@ -408,12 +422,9 @@ function openAIToVertex(openaiBody) {
           } else {
             parts.push({ fileData: { mimeType: 'image/jpeg', fileUri: imageUrl } });
           }
-        } else if (item.type === 'input_audio') {
-          parts.push({ inlineData: { mimeType: `audio/${item.input_audio?.format || 'wav'}`, data: item.input_audio?.data || '' } });
         }
       }
     }
-
     if (msg.tool_calls && msg.tool_calls.length > 0) {
       for (const tc of msg.tool_calls) {
         let args = {};
@@ -430,7 +441,6 @@ function openAIToVertex(openaiBody) {
         parts.push(fcPart);
       }
     }
-
     if (msg.function_call) {
       let args = {};
       if (typeof msg.function_call.arguments === 'string') {
@@ -440,7 +450,6 @@ function openAIToVertex(openaiBody) {
       }
       parts.push({ functionCall: { name: msg.function_call.name, args } });
     }
-
     if (parts.length > 0) contents.push({ role, parts });
     i++;
   }
@@ -473,10 +482,6 @@ function openAIToVertex(openaiBody) {
     toolConfig = { functionCallingConfig: { mode: 'AUTO' } };
   } else if (typeof openaiBody.tool_choice === 'object' && openaiBody.tool_choice?.function?.name) {
     toolConfig = { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [openaiBody.tool_choice.function.name] } };
-  } else if (openaiBody.function_call === 'none') {
-    toolConfig = { functionCallingConfig: { mode: 'NONE' } };
-  } else if (typeof openaiBody.function_call === 'object' && openaiBody.function_call?.name) {
-    toolConfig = { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [openaiBody.function_call.name] } };
   }
 
   const vertexBody = {
@@ -493,16 +498,91 @@ function openAIToVertex(openaiBody) {
   if (tools) vertexBody.tools = tools;
   if (toolConfig) vertexBody.toolConfig = toolConfig;
 
-  log('[VERTEX-CONTENTS]', contents.length, 'turns');
-  contents.forEach((c, idx) => {
-    log(`  [${idx}] role=${c.role} parts=${c.parts.length}`, c.parts.map(p => Object.keys(p).join(',')).join(' | '));
-  });
-
-  return { model, vertexBody };
+  return vertexBody;
 }
 
-// ─── Vertex → OpenAI (Legacy) ──────────────────────────────────
-function mapFinishReason(vertexFinishReason, hasToolCalls) {
+function buildAnthropicBody(openaiBody) {
+  const messages = [];
+  let system = null;
+  for (const msg of openaiBody.messages || []) {
+    if (msg.role === 'system' || msg.role === 'developer') {
+      if (typeof msg.content === 'string') system = msg.content;
+      continue;
+    }
+    if (msg.role === 'tool' || msg.role === 'function') {
+      messages.push({
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: msg.tool_call_id || 'unknown',
+          content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+        }]
+      });
+      continue;
+    }
+    if (msg.role === 'assistant' && msg.tool_calls) {
+      const content = [];
+      if (msg.content) content.push({ type: 'text', text: msg.content });
+      for (const tc of msg.tool_calls) {
+        content.push({
+          type: 'tool_use',
+          id: tc.id,
+          name: tc.function.name,
+          input: typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments
+        });
+      }
+      messages.push({ role: 'assistant', content });
+      continue;
+    }
+    if (typeof msg.content === 'string') {
+      messages.push({ role: msg.role, content: msg.content });
+    } else if (Array.isArray(msg.content)) {
+      const anthropicContent = [];
+      for (const item of msg.content) {
+        if (item.type === 'text') anthropicContent.push({ type: 'text', text: item.text });
+        else if (item.type === 'image_url') {
+          const imageUrl = item.image_url?.url || '';
+          if (imageUrl.startsWith('data:')) {
+            const m = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
+            if (m) anthropicContent.push({ type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } });
+          }
+        }
+      }
+      messages.push({ role: msg.role, content: anthropicContent });
+    }
+  }
+
+  const body = {
+    anthropic_version: 'vertex-2023-10-16',
+    stream: openaiBody.stream !== false,
+    max_tokens: openaiBody.max_tokens || 512,
+    temperature: openaiBody.temperature ?? 1,
+    messages: messages
+  };
+  if (system) body.system = system;
+  if (openaiBody.top_p != null) body.top_p = openaiBody.top_p;
+  if (openaiBody.stop) body.stop_sequences = Array.isArray(openaiBody.stop) ? openaiBody.stop : [openaiBody.stop];
+  if (openaiBody.tools) {
+    body.tools = openaiBody.tools.map(t => ({
+      name: t.function.name,
+      description: t.function.description,
+      input_schema: t.function.parameters
+    }));
+  }
+  return body;
+}
+
+function buildDeepSeekBody(openaiBody) {
+  // DeepSeek publisher endpoint expects OpenAI format but with model in URL
+  // So we pass the body through but remove the model field (it's in the URL)
+  const body = { ...openaiBody };
+  delete body.model;
+  return body;
+}
+
+// ─── Response Translators ──────────────────────────────────────
+
+function mapGeminiFinishReason(vertexFinishReason, hasToolCalls) {
   if (!vertexFinishReason) return null;
   const map = {
     'STOP': hasToolCalls ? 'tool_calls' : 'stop',
@@ -514,7 +594,7 @@ function mapFinishReason(vertexFinishReason, hasToolCalls) {
   return map[vertexFinishReason] || 'stop';
 }
 
-function buildOpenAIStreamingChunk(vertexChunk, id, model, isFirst) {
+function geminiToOpenAIStreamingChunk(vertexChunk, id, model, isFirst) {
   const candidate = vertexChunk.candidates?.[0];
   if (!candidate) return null;
   const parts = candidate.content?.parts || [];
@@ -543,11 +623,11 @@ function buildOpenAIStreamingChunk(vertexChunk, id, model, isFirst) {
     object: 'chat.completion.chunk',
     created: Math.floor(Date.now() / 1000),
     model: model,
-    choices: [{ index: 0, delta: delta, finish_reason: mapFinishReason(candidate.finishReason, hasToolCalls), logprobs: null }]
+    choices: [{ index: 0, delta: delta, finish_reason: mapGeminiFinishReason(candidate.finishReason, hasToolCalls), logprobs: null }]
   };
 }
 
-function buildOpenAINonStreamingResponse(events, id, model) {
+function geminiToOpenAINonStreaming(events, id, model) {
   let fullText = '';
   const toolCalls = [];
   let finishReason = 'stop';
@@ -555,7 +635,7 @@ function buildOpenAINonStreamingResponse(events, id, model) {
   for (const event of events) {
     if (event === '[DONE]') continue;
     try {
-      const chunk = safeJsonParse(event, 'non-stream-vertex');
+      const chunk = safeJsonParse(event, 'gemini-non-stream');
       const candidate = chunk.candidates?.[0];
       if (!candidate) continue;
       for (const part of candidate.content?.parts || []) {
@@ -574,8 +654,8 @@ function buildOpenAINonStreamingResponse(events, id, model) {
           toolCalls.push(tc);
         }
       }
-      if (candidate.finishReason) finishReason = mapFinishReason(candidate.finishReason, hasToolCalls);
-    } catch (e) { log('[NON-STREAM-PARSE-ERR]', e.message); }
+      if (candidate.finishReason) finishReason = mapGeminiFinishReason(candidate.finishReason, hasToolCalls);
+    } catch (e) { log('[GEMINI-PARSE-ERR]', e.message); }
   }
   return {
     id: `chatcmpl-${id}`,
@@ -598,7 +678,154 @@ function buildOpenAINonStreamingResponse(events, id, model) {
   };
 }
 
-// ─── HTTP Request Helper ───────────────────────────────────────
+function anthropicToOpenAIStreamingChunk(anthropicEvent, id, model) {
+  if (anthropicEvent.type === 'content_block_delta' && anthropicEvent.delta?.text) {
+    return {
+      id: `chatcmpl-${id}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: model,
+      choices: [{ index: 0, delta: { content: anthropicEvent.delta.text }, finish_reason: null, logprobs: null }]
+    };
+  }
+  if (anthropicEvent.type === 'message_stop') {
+    return {
+      id: `chatcmpl-${id}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: model,
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop', logprobs: null }]
+    };
+  }
+  if (anthropicEvent.type === 'content_block_start' && anthropicEvent.content_block?.type === 'tool_use') {
+    const tb = anthropicEvent.content_block;
+    return {
+      id: `chatcmpl-${id}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model: model,
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: tb.id,
+            type: 'function',
+            function: { name: tb.name, arguments: JSON.stringify(tb.input || {}) }
+          }]
+        },
+        finish_reason: null,
+        logprobs: null
+      }]
+    };
+  }
+  return null;
+}
+
+function anthropicToOpenAINonStreaming(anthropicResponse, id, model) {
+  const content = anthropicResponse.content || [];
+  let fullText = '';
+  const toolCalls = [];
+  for (const block of content) {
+    if (block.type === 'text') fullText += block.text;
+    if (block.type === 'tool_use') {
+      toolCalls.push({
+        id: block.id,
+        type: 'function',
+        function: { name: block.name, arguments: JSON.stringify(block.input || {}) }
+      });
+    }
+  }
+  return {
+    id: `chatcmpl-${id}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: model,
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: fullText || null,
+        refusal: null,
+        tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+        function_call: undefined
+      },
+      finish_reason: anthropicResponse.stop_reason === 'tool_use' ? 'tool_calls' : 'stop',
+      logprobs: null
+    }],
+    usage: {
+      prompt_tokens: anthropicResponse.usage?.input_tokens || -1,
+      completion_tokens: anthropicResponse.usage?.output_tokens || -1,
+      total_tokens: (anthropicResponse.usage?.input_tokens || 0) + (anthropicResponse.usage?.output_tokens || 0)
+    }
+  };
+}
+
+// ─── Streaming Request Helper ──────────────────────────────────
+// For streaming: pipe response directly, parse SSE on the fly
+function makeStreamingRequest(url, options, body, onEvent, onError, onEnd) {
+  const parsed = new URL(url);
+  const client = parsed.protocol === 'https:' ? https : http;
+  const req = client.request(parsed, options, (res) => {
+    if (res.statusCode !== 200) {
+      let errorData = '';
+      res.on('data', c => errorData += c);
+      res.on('end', () => {
+        const err = new Error(`HTTP ${res.statusCode}: ${errorData.substring(0, 500)}`);
+        err.statusCode = res.statusCode;
+        // Try to extract retry-after
+        const retryAfter = res.headers['retry-after'];
+        if (retryAfter) {
+          const ms = parseInt(retryAfter) * 1000;
+          if (!isNaN(ms)) err.retryAfter = ms;
+        }
+        onError(err);
+      });
+      return;
+    }
+
+    const decoder = new TextDecoder('utf-8');
+    const parser = new SseParser();
+
+    res.on('data', (chunk) => {
+      const text = decoder.decode(chunk, { stream: true });
+      const events = parser.feed(text);
+      for (const event of events) {
+        if (event === '[DONE]') continue;
+        onEvent(event);
+      }
+    });
+
+    res.on('end', () => {
+      try {
+        const events = parser.feed(decoder.decode());
+        for (const event of events) {
+          if (event === '[DONE]') continue;
+          onEvent(event);
+        }
+        const events2 = parser.flush();
+        for (const event of events2) {
+          if (event === '[DONE]') continue;
+          onEvent(event);
+        }
+      } catch (e) { log('[STREAM-DECODER-ERR]', e.message); }
+      onEnd();
+    });
+
+    res.on('error', (err) => { err.statusCode = 0; onError(err); });
+  });
+
+  req.on('error', (err) => { err.statusCode = 0; onError(err); });
+  req.on('timeout', () => {
+    req.destroy();
+    const err = new Error('Timeout'); err.statusCode = 0; err.code = 'ETIMEDOUT'; onError(err);
+  });
+  req.setTimeout(REQUEST_TIMEOUT_MS);
+  if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body));
+  req.end();
+}
+
+// For non-streaming: buffer entire response
 function makeRequest(url, options, body) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
@@ -611,6 +838,11 @@ function makeRequest(url, options, body) {
           const err = new Error(`HTTP ${res.statusCode}: ${data.substring(0, 500)}`);
           err.statusCode = res.statusCode;
           err.data = data;
+          const retryAfter = res.headers['retry-after'];
+          if (retryAfter) {
+            const ms = parseInt(retryAfter) * 1000;
+            if (!isNaN(ms)) err.retryAfter = ms;
+          }
           reject(err);
           return;
         }
@@ -625,44 +857,35 @@ function makeRequest(url, options, body) {
   });
 }
 
-// ─── Proxy Endpoints ───────────────────────────────────────────
-async function proxyOpenAIEndpoint(openaiBody, authToken, stream) {
-  const model = openaiBody.model || DEFAULT_MODEL;
-  const url = getVertexUrl(model, true);
+// ─── Proxy Dispatch ────────────────────────────────────────────
+function buildRequestBody(openaiBody, info) {
+  if (info.endpoint === 'anthropic') return buildAnthropicBody(openaiBody);
+  if (info.endpoint === 'publisher') return buildDeepSeekBody(openaiBody);
+  if (info.endpoint === 'legacy') return buildGeminiBody(openaiBody);
+  // openai: pass through
+  return openaiBody;
+}
+
+function getRequestHeaders(authToken, info, stream) {
   const headers = {
     'Content-Type': 'application/json',
-    'Accept': stream ? 'text/event-stream' : 'application/json',
     'Authorization': `Bearer ${authToken}`
   };
-  log('[OPENAI-ENDPOINT]', url.replace(authToken, '***'));
-  return await makeRequest(url, { method: 'POST', headers }, openaiBody);
+  if (stream) {
+    headers['Accept'] = 'text/event-stream';
+  } else {
+    headers['Accept'] = 'application/json';
+  }
+  return headers;
 }
 
-async function proxyLegacyEndpoint(openaiBody, authToken, stream) {
-  const { model, vertexBody } = openAIToVertex(openaiBody);
-  const url = getVertexUrl(model, false);
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'text/event-stream'
-  };
-  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-  log('[LEGACY-ENDPOINT]', url.replace(authToken || API_KEY, '***'));
-  return await makeRequest(url, { method: 'POST', headers }, vertexBody);
-}
-
-// ════════════════════════════════════════════════════════════════
-// BUILT-IN OAUTH 2.0 FLOW (run once to get refresh token)
-// ════════════════════════════════════════════════════════════════
-
+// ─── OAuth Flow ────────────────────────────────────────────────
 let oauthState = null;
-let oauthCodePromise = null;
-
 function startOAuthFlow() {
   if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
     console.error('[OAUTH] Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET');
     return;
   }
-
   oauthState = crypto.randomBytes(16).toString('hex');
   const redirectUri = `http://localhost:${OAUTH_REDIRECT_PORT}/auth/callback`;
   const scope = encodeURIComponent('https://www.googleapis.com/auth/cloud-platform');
@@ -673,28 +896,14 @@ function startOAuthFlow() {
   console.log('  ' + authUrl);
   console.log('═══════════════════════════════════════════════════════════════\n');
 
-  // Try to open browser automatically
   const platform = process.platform;
   let cmd;
   if (platform === 'darwin') cmd = `open "${authUrl}"`;
   else if (platform === 'win32') cmd = `start "" "${authUrl}"`;
   else cmd = `xdg-open "${authUrl}"`;
-
   exec(cmd, (err) => {
-    if (err) console.log('[OAUTH] Could not auto-open browser. Please open the URL manually.');
+    if (err) console.log('[OAUTH] Could not auto-open browser. Open URL manually.');
   });
-
-  oauthCodePromise = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error('OAuth timeout: no callback received in 5 minutes'));
-    }, 300000);
-
-    // Store resolver globally for the callback handler
-    global.oauthResolve = (code) => { clearTimeout(timeout); resolve(code); };
-    global.oauthReject = (err) => { clearTimeout(timeout); reject(err); };
-  });
-
-  return oauthCodePromise;
 }
 
 async function exchangeCodeForTokens(code) {
@@ -724,7 +933,6 @@ async function exchangeCodeForTokens(code) {
             console.log(`  GOOGLE_ACCESS_TOKEN="${json.access_token}"`);
             if (json.refresh_token) {
               console.log(`  GOOGLE_REFRESH_TOKEN="${json.refresh_token}"`);
-              console.log('');
               console.log('  IMPORTANT: Save the refresh_token! You only get it once.');
             }
             console.log('═══════════════════════════════════════════════════════════════\n');
@@ -741,7 +949,6 @@ async function exchangeCodeForTokens(code) {
   });
 }
 
-// ─── OAuth Callback Server ─────────────────────────────────────
 const oauthServer = http.createServer(async (req, res) => {
   if (req.url.startsWith('/auth/callback')) {
     const parsed = new URL(req.url, `http://localhost:${OAUTH_REDIRECT_PORT}`);
@@ -751,40 +958,30 @@ const oauthServer = http.createServer(async (req, res) => {
 
     if (error) {
       res.writeHead(400, { 'Content-Type': 'text/html' });
-      res.end(`<h1>OAuth Error</h1><p>${error}</p><p>${parsed.searchParams.get('error_description') || ''}</p>`);
-      if (global.oauthReject) global.oauthReject(new Error(`OAuth error: ${error}`));
+      res.end(`<h1>OAuth Error</h1><p>${error}</p>`);
       return;
     }
-
     if (!code) {
       res.writeHead(400, { 'Content-Type': 'text/html' });
       res.end('<h1>Missing code</h1>');
-      if (global.oauthReject) global.oauthReject(new Error('Missing authorization code'));
       return;
     }
-
     if (state !== oauthState) {
       res.writeHead(400, { 'Content-Type': 'text/html' });
       res.end('<h1>Invalid state</h1>');
-      if (global.oauthReject) global.oauthReject(new Error('Invalid state parameter'));
       return;
     }
-
     try {
       await exchangeCodeForTokens(code);
       res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<h1>Success!</h1><p>You can close this tab and check the proxy console for your tokens.</p>');
-      if (global.oauthResolve) global.oauthResolve(code);
+      res.end('<h1>Success!</h1><p>Check proxy console for your tokens.</p>');
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'text/html' });
       res.end(`<h1>Error</h1><p>${err.message}</p>`);
-      if (global.oauthReject) global.oauthReject(err);
     }
     return;
   }
-
-  res.writeHead(404);
-  res.end('Not found');
+  res.writeHead(404); res.end('Not found');
 });
 
 // ─── Main Proxy Server ─────────────────────────────────────────
@@ -799,7 +996,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // OAuth start endpoint
   if (req.url === '/auth/start') {
     if (!OAUTH_CLIENT_ID || !OAUTH_CLIENT_SECRET) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -808,22 +1004,22 @@ const server = http.createServer(async (req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ message: 'Check proxy console for browser URL' }));
-    startOAuthFlow().catch(err => console.error('[OAUTH]', err.message));
+    startOAuthFlow();
     return;
   }
 
   if (req.url === '/health') {
-    const token = await getAuthToken(null).catch(() => null);
+    const token = await getAuthToken().catch(() => null);
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
       models: AVAILABLE_MODELS,
       circuit: circuitBreaker.state,
       queue: { running: requestQueue.running, pending: requestQueue.queue.length },
+      rate_limits: Object.fromEntries([...modelRateLimits.entries()].map(([k, v]) => [k, { reset_in_ms: Math.max(0, v.resetAt - Date.now()) }])),
       auth: {
-        mode: serviceAccount ? 'service_account' : (REFRESH_TOKEN ? 'refresh_token' : (ACCESS_TOKEN ? 'access_token' : (API_KEY ? 'api_key' : 'none'))),
+        mode: serviceAccount ? 'service_account' : (REFRESH_TOKEN ? 'refresh_token' : (ACCESS_TOKEN ? 'access_token' : 'api_key')),
         token_valid: !!token,
-        endpoint_mode: USE_OPENAI_ENDPOINT ? 'openai_native' : 'legacy_gemini'
       }
     }));
     return;
@@ -833,12 +1029,17 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       object: 'list',
-      data: AVAILABLE_MODELS.map(m => ({
-        id: m,
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'google'
-      }))
+      data: AVAILABLE_MODELS.map(m => {
+        const info = MODEL_REGISTRY[m];
+        return {
+          id: m,
+          object: 'model',
+          created: Math.floor(Date.now() / 1000),
+          owned_by: info.provider,
+          provider: info.provider,
+          location: info.location
+        };
+      })
     }));
     return;
   }
@@ -885,84 +1086,113 @@ const server = http.createServer(async (req, res) => {
 
   const stream = openaiBody.stream === true;
   const requestId = generateId();
-  const clientAuth = req.headers['authorization'] || '';
 
   try {
-    const authToken = await getAuthToken(clientAuth);
+    const authToken = await getAuthToken();
     if (!authToken && !API_KEY) {
       throw new Error('No valid authentication token available');
     }
 
-    const useOpenAIEndpoint = USE_OPENAI_ENDPOINT && authToken && PROJECT_ID;
-    log('[MODE]', useOpenAIEndpoint ? 'openai_native' : 'legacy_gemini');
+    const model = resolveModel(openaiBody.model || DEFAULT_MODEL);
+    const modelInfo = getModelInfo(model);
+    log('[MODEL]', model, '| provider:', modelInfo.provider, '| endpoint:', modelInfo.endpoint, '| location:', modelInfo.location);
 
-    const vertexResponse = await requestQueue.enqueue(() =>
-      retryWithBackoff(() => {
-        if (useOpenAIEndpoint) {
-          return proxyOpenAIEndpoint(openaiBody, authToken, stream);
-        } else {
-          return proxyLegacyEndpoint(openaiBody, authToken, stream);
-        }
-      }, openaiBody.model || DEFAULT_MODEL)
-    );
+    const url = getVertexUrl(model, modelInfo);
+    const requestBody = buildRequestBody(openaiBody, modelInfo);
+    const headers = getRequestHeaders(authToken, modelInfo, stream);
+
+    log('[URL]', url.replace(authToken, '***'));
 
     if (stream) {
+      // ─── Streaming: pipe directly ─────────────────────────────
       res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive'
       });
 
-      if (useOpenAIEndpoint) {
-        const parser = new SseParser();
-        const events = parser.feed(vertexResponse.data);
-        const events2 = parser.flush();
-        const allEvents = [...events, ...events2];
-        for (const event of allEvents) {
-          if (event === '[DONE]') { res.write('data: [DONE]\n\n'); continue; }
-          try {
-            const chunk = safeJsonParse(event, 'openai-native-stream');
-            if (chunk.model) chunk.model = openaiBody.model || DEFAULT_MODEL;
-            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-          } catch (e) { log('[NATIVE-STREAM-ERR]', e.message, event.substring(0, 200)); }
-        }
-        res.end();
-      } else {
-        const parser = new SseParser();
-        const events = parser.feed(vertexResponse.data);
-        const events2 = parser.flush();
-        const allEvents = [...events, ...events2];
-        let isFirst = true;
-        for (const event of allEvents) {
-          if (event === '[DONE]') continue;
-          try {
-            const vertexChunk = safeJsonParse(event, 'legacy-stream');
-            const openaiChunk = buildOpenAIStreamingChunk(vertexChunk, requestId, openaiBody.model || DEFAULT_MODEL, isFirst);
-            isFirst = false;
-            if (openaiChunk) res.write(`data: ${JSON.stringify(openaiChunk)}\n\n`);
-          } catch (e) { log('[LEGACY-STREAM-ERR]', e.message, event.substring(0, 200)); }
-        }
-        res.write(`data: {"id":"chatcmpl-${requestId}","object":"chat.completion.chunk","created":${Math.floor(Date.now() / 1000)},"model":"${openaiBody.model || DEFAULT_MODEL}","choices":[{"index":0,"delta":{},"finish_reason":null,"logprobs":null}]}\n\n`);
+      let isFirst = true;
+      let hasError = false;
+
+      await requestQueue.enqueue(() =>
+        retryWithBackoff(() => new Promise((resolve, reject) => {
+          makeStreamingRequest(url, { method: 'POST', headers }, requestBody,
+            (event) => {
+              if (event === '[DONE]') return;
+              try {
+                if (modelInfo.endpoint === 'anthropic') {
+                  // Anthropic SSE: event: xxx\ndata: {...}
+                  // But we already parsed the data line in makeStreamingRequest
+                  // event here is just the data payload
+                  try {
+                    const parsed = safeJsonParse(event, 'anthropic-stream');
+                    const chunk = anthropicToOpenAIStreamingChunk(parsed, requestId, model);
+                    if (chunk) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                  } catch (e) {
+                    // Might be a non-JSON event line, skip
+                    log('[ANTHROPIC-SKIP]', event.substring(0, 100));
+                  }
+                } else if (modelInfo.endpoint === 'openai' || modelInfo.endpoint === 'publisher') {
+                  // OpenAI-native or DeepSeek publisher
+                  try {
+                    const parsed = safeJsonParse(event, 'openai-stream');
+                    if (parsed.model) parsed.model = model;
+                    res.write(`data: ${JSON.stringify(parsed)}\n\n`);
+                  } catch (e) {
+                    log('[OPENAI-SKIP]', event.substring(0, 100));
+                  }
+                } else {
+                  // Legacy Gemini
+                  const parsed = safeJsonParse(event, 'gemini-stream');
+                  const chunk = geminiToOpenAIStreamingChunk(parsed, requestId, model, isFirst);
+                  isFirst = false;
+                  if (chunk) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                }
+              } catch (e) {
+                log('[STREAM-EVENT-ERR]', e.message, event.substring(0, 200));
+              }
+            },
+            (err) => {
+              hasError = true;
+              log('[STREAM-ERR]', err.message);
+              reject(err);
+            },
+            () => {
+              if (!hasError) resolve();
+            }
+          );
+        }), model, model)
+      );
+
+      if (!hasError) {
+        res.write(`data: {"id":"chatcmpl-${requestId}","object":"chat.completion.chunk","created":${Math.floor(Date.now() / 1000)},"model":"${model}","choices":[{"index":0,"delta":{},"finish_reason":null,"logprobs":null}]}\n\n`);
         res.write('data: [DONE]\n\n');
-        res.end();
       }
+      res.end();
+
     } else {
-      if (useOpenAIEndpoint) {
-        const data = safeJsonParse(vertexResponse.data, 'openai-native-response');
-        log('[NATIVE-RESPONSE]', JSON.stringify(data).substring(0, 300));
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(data));
+      // ─── Non-streaming: buffer ────────────────────────────────
+      const vertexResponse = await requestQueue.enqueue(() =>
+        retryWithBackoff(() => makeRequest(url, { method: 'POST', headers }, requestBody), model, model)
+      );
+
+      let response;
+      if (modelInfo.endpoint === 'anthropic') {
+        const parsed = safeJsonParse(vertexResponse.data, 'anthropic-response');
+        response = anthropicToOpenAINonStreaming(parsed, requestId, model);
+      } else if (modelInfo.endpoint === 'openai' || modelInfo.endpoint === 'publisher') {
+        response = safeJsonParse(vertexResponse.data, 'openai-response');
+        if (response.model) response.model = model;
       } else {
         const parser = new SseParser();
         const events = parser.feed(vertexResponse.data);
         const events2 = parser.flush();
-        const allEvents = [...events, ...events2];
-        log('[LEGACY-EVENTS]', allEvents.length);
-        const response = buildOpenAINonStreamingResponse(allEvents, requestId, openaiBody.model || DEFAULT_MODEL);
-        log('[LEGACY-RESPONSE]', JSON.stringify(response).substring(0, 300));
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(response));
+        response = geminiToOpenAINonStreaming([...events, ...events2], requestId, model);
       }
+
+      log('[RESPONSE]', JSON.stringify(response).substring(0, 300));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(response));
     }
 
   } catch (err) {
@@ -981,13 +1211,11 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// ─── Start Servers ─────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`Vertex AI OpenAI Proxy v7 running on port ${PORT}`);
+  console.log(`Vertex AI Multi-Provider Proxy v9 running on port ${PORT}`);
   console.log(`Auth mode: ${serviceAccount ? 'Service Account' : (REFRESH_TOKEN ? 'OAuth Refresh Token' : (ACCESS_TOKEN ? 'OAuth Access Token' : 'API Key'))}`);
-  console.log(`Endpoint mode: ${USE_OPENAI_ENDPOINT ? 'OpenAI-native' : 'Legacy Gemini'}`);
   console.log(`Models: ${AVAILABLE_MODELS.join(', ')}`);
-  console.log(`Project: ${PROJECT_ID || '(none)'}, Location: ${LOCATION}`);
+  console.log(`Project: ${PROJECT_ID || '(none)'}`);
   console.log(`429 mitigation: concurrent=${MAX_CONCURRENT}, retries=${MAX_RETRIES}, circuit=${CIRCUIT_THRESHOLD}`);
   console.log(`Debug: ${DEBUG ? 'enabled' : 'disabled'}`);
   console.log('');
@@ -996,12 +1224,11 @@ server.listen(PORT, () => {
   console.log(`  Health:    http://localhost:${PORT}/health`);
   console.log(`  Models:    http://localhost:${PORT}/v1/models`);
   if (OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && !REFRESH_TOKEN && !ACCESS_TOKEN) {
-    console.log(`  OAuth:     http://localhost:${PORT}/auth/start  (run this to get tokens)`);
+    console.log(`  OAuth:     http://localhost:${PORT}/auth/start`);
   }
   console.log('');
 });
 
-// Start OAuth callback server if needed
 if (OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET) {
   oauthServer.listen(OAUTH_REDIRECT_PORT, () => {
     console.log(`OAuth callback server on port ${OAUTH_REDIRECT_PORT}`);
