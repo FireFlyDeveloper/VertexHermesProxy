@@ -22,7 +22,6 @@ const https = require('https');
 const { URL } = require('url');
 const crypto = require('crypto');
 const { exec } = require('child_process');
-require('dotenv').config();
 
 // ─── Config ────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
