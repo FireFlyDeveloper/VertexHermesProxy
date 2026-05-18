@@ -41,13 +41,22 @@ const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '120000', 
 
 // ─── Model Registry ────────────────────────────────────────────
 const MODEL_REGISTRY = {
-  'gemini-3.1-flash-lite': { provider: 'google', endpoint: 'openai', location: 'global' },
-  'gemini-3.1-pro-preview': { provider: 'google', endpoint: 'openai', location: 'global' },
+  // Google Gemini
+  'gemini-3.1-flash-lite':      { provider: 'google',    endpoint: 'openai',    location: 'global' },
+  'gemini-3.1-pro-preview':     { provider: 'google',    endpoint: 'openai',    location: 'global' },
+  // Moonshot
   'moonshotai/kimi-k2-thinking-maas': { provider: 'moonshot', endpoint: 'openai', location: 'global' },
-  'deepseek-ai/deepseek-v3.2-maas': { provider: 'deepseek', endpoint: 'publisher', location: 'global' },
-  'deepseek-ai/deepseek-r1-0528-maas': { provider: 'deepseek', endpoint: 'publisher', location: 'us-central1' },
-  'claude-haiku-4-5': { provider: 'anthropic', endpoint: 'anthropic', location: 'global' },
-  'claude-sonnet-4-6': { provider: 'anthropic', endpoint: 'anthropic', location: 'global' },
+  // DeepSeek
+  'deepseek-ai/deepseek-v3.2-maas':   { provider: 'deepseek', endpoint: 'openai', location: 'global' },
+  'deepseek-ai/deepseek-v3.1-maas':   { provider: 'deepseek', endpoint: 'openai', location: 'us-west2' },
+  'deepseek-ai/deepseek-r1-0528-maas':{ provider: 'deepseek', endpoint: 'publisher', location: 'us-central1' },
+  // Anthropic Claude
+  'claude-haiku-4-5':           { provider: 'anthropic', endpoint: 'anthropic', location: 'global' },
+  'claude-sonnet-4-6':          { provider: 'anthropic', endpoint: 'anthropic', location: 'global' },
+  // Zhipu AI (GLM)
+  'zai-org/glm-4.7-maas':       { provider: 'zhipu',     endpoint: 'openai',    location: 'global' },
+  // Alibaba Qwen
+  'qwen/qwen3-235b-a22b-instruct-2507-maas': { provider: 'qwen', endpoint: 'openai', location: 'us-south1' },
 };
 
 const MODEL_ALIASES = {
@@ -215,7 +224,17 @@ function generateId(prefix = 'chatcmpl') {
 
 function getVertexUrl(model, info) {
   const apiVersion = info.endpoint === 'anthropic' ? 'v1' : 'v1beta1';
-  const endpoint = info.location === 'us-central1' ? 'us-central1-aiplatform.googleapis.com' : ENDPOINT;
+
+  // Determine endpoint hostname based on location
+  let endpoint;
+  if (info.location === 'global') {
+    endpoint = ENDPOINT;  // aiplatform.googleapis.com
+  } else if (info.location.includes('-')) {
+    // Regional endpoints: us-central1, us-west2, us-south1, etc.
+    endpoint = `${info.location}-aiplatform.googleapis.com`;
+  } else {
+    endpoint = ENDPOINT;
+  }
 
   if (info.endpoint === 'openai') {
     return `https://${endpoint}/${apiVersion}/projects/${PROJECT_ID}/locations/${info.location}/endpoints/openapi/chat/completions`;
@@ -229,7 +248,7 @@ function getVertexUrl(model, info) {
   }
   // Legacy Gemini
   if (PROJECT_ID) {
-    return `https://${info.location}-aiplatform.googleapis.com/${apiVersion}/projects/${PROJECT_ID}/locations/${info.location}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
+    return `https://${endpoint}/${apiVersion}/projects/${PROJECT_ID}/locations/${info.location}/publishers/google/models/${model}:streamGenerateContent?alt=sse`;
   }
   return `https://aiplatform.googleapis.com/${apiVersion}/publishers/google/models/${model}:streamGenerateContent?alt=sse&key=${API_KEY}`;
 }
@@ -1165,7 +1184,7 @@ const server = http.createServer(async (req, res) => {
       );
 
       if (!hasError) {
-        res.write(`data: {"id":"chatcmpl-${requestId}","object":"chat.completion.chunk","created":${Math.floor(Date.now() / 1000)},"model":"${model}","choices":[{"index":0,"delta":{},"finish_reason":null,"logprobs":null}]}\n\n`);
+        res.write(`data: {"id":"chatcmpl-${requestId}","object":"chat.completion.chunk","created":${Math.floor(Date.now()/1000)},"model":"${model}","choices":[{"index":0,"delta":{},"finish_reason":null,"logprobs":null}]}\n\n`);
         res.write('data: [DONE]\n\n');
       }
       res.end();
