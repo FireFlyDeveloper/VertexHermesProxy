@@ -82,7 +82,12 @@ let cachedToken = { token: null, expiry: 0 };
 if (SERVICE_ACCOUNT_JSON) {
   try {
     serviceAccount = JSON.parse(SERVICE_ACCOUNT_JSON);
-    log('[AUTH]', 'Service account:', serviceAccount.client_email);
+    if (!serviceAccount.private_key || serviceAccount.private_key.trim() === '') {
+      console.error('[WARN] GOOGLE_SERVICE_ACCOUNT_JSON has empty private_key - service account auth disabled');
+      serviceAccount = null;
+    } else {
+      log('[AUTH]', 'Service account:', serviceAccount.client_email);
+    }
   } catch (e) {
     console.error('[FATAL] Invalid GOOGLE_SERVICE_ACCOUNT_JSON:', e.message);
     process.exit(1);
@@ -183,23 +188,42 @@ async function refreshAccessToken() {
 }
 
 async function getAuthToken(clientBearerToken) {
-  if (clientBearerToken && clientBearerToken.startsWith('Bearer ')) {
-    const token = clientBearerToken.slice(7).trim();
-    if (token && token !== 'dummy-key' && token !== 'sk-test') {
-      log('[AUTH]', 'Client Bearer token');
-      return token;
+  // NOTE: We do NOT pass through client Bearer tokens.
+  // Hermes may send dummy keys ("sk-test", "dummy-key") or its own API keys
+  // that are NOT valid Google OAuth 2.0 access tokens. Vertex requires
+  // a real Google-issued OAuth token. Always use the proxy's configured auth.
+
+  // Priority 1: Service account (auto-refresh JWT)
+  if (serviceAccount) {
+    try {
+      const token = await getOAuthTokenFromServiceAccount();
+      if (token) return token;
+    } catch (err) {
+      log('[AUTH]', 'Service account failed:', err.message, '- trying fallback auth');
     }
   }
-  if (serviceAccount) return await getOAuthTokenFromServiceAccount();
+
+  // Priority 2: OAuth refresh token (auto-refresh access token)
   if (REFRESH_TOKEN && OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET) {
-    const now = Math.floor(Date.now() / 1000);
-    if (cachedToken.token && cachedToken.expiry > now + 60) {
-      log('[AUTH]', 'Cached access token');
-      return cachedToken.token;
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      if (cachedToken.token && cachedToken.expiry > now + 60) {
+        log('[AUTH]', 'Cached access token');
+        return cachedToken.token;
+      }
+      return await refreshAccessToken();
+    } catch (err) {
+      log('[AUTH]', 'Refresh token failed:', err.message, '- trying fallback auth');
     }
-    return await refreshAccessToken();
   }
-  if (ACCESS_TOKEN) return ACCESS_TOKEN;
+
+  // Priority 3: Static access token (no refresh)
+  if (ACCESS_TOKEN) {
+    log('[AUTH]', 'Static access token');
+    return ACCESS_TOKEN;
+  }
+
+  // Priority 4: API key (legacy, only for non-OAuth endpoints)
   return null;
 }
 
