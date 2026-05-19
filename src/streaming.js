@@ -2,12 +2,12 @@ const http = require('http');
 const https = require('https');
 const { config, log } = require('./config');
 const { getAuthToken } = require('./auth');
-const { 
-  resolveModel, 
-  getModelInfo, 
-  getVertexUrl, 
-  generateId, 
-  safeJsonParse 
+const {
+  resolveModel,
+  getModelInfo,
+  getVertexUrl,
+  generateId,
+  safeJsonParse
 } = require('./models');
 const { requestQueue, retryWithBackoff } = require('./queue');
 const {
@@ -20,7 +20,7 @@ const {
 // SSE Parser
 class SseParser {
   constructor() { this.buffer = ''; }
-  
+
   feed(text) {
     this.buffer += text;
     const events = [];
@@ -37,7 +37,7 @@ class SseParser {
     }
     return events;
   }
-  
+
   flush() {
     const events = [];
     if (this.buffer.trim()) {
@@ -95,7 +95,7 @@ function makeRequest(url, options, body) {
 function makeStreamingRequest(url, options, body, onEvent, onError, onEnd) {
   const parsed = new URL(url);
   const client = parsed.protocol === 'https:' ? https : http;
-  
+
   const req = client.request(parsed, options, (res) => {
     if (res.statusCode !== 200) {
       let errorData = '';
@@ -153,7 +153,7 @@ function makeStreamingRequest(url, options, body, onEvent, onError, onEnd) {
     err.statusCode = 0;
     onError(err);
   });
-  
+
   req.on('timeout', () => {
     req.destroy();
     const err = new Error('Timeout');
@@ -161,11 +161,11 @@ function makeStreamingRequest(url, options, body, onEvent, onError, onEnd) {
     err.code = 'ETIMEDOUT';
     onError(err);
   });
-  
+
   req.setTimeout(config.REQUEST_TIMEOUT_MS);
   if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body));
   req.end();
-  
+
   return req;
 }
 
@@ -215,13 +215,13 @@ async function processNonStreaming(req, res, openaiBody, requestId) {
 async function processStreaming(req, res, openaiBody, requestId) {
   let headersSent = false;
   let requestAborted = false;
-  
+
   // Handle client disconnect
   req.on('close', () => {
     requestAborted = true;
     log('[STREAM] Client disconnected');
   });
-  
+
   try {
     const authToken = await getAuthToken();
     if (!authToken && !config.API_KEY) {
@@ -247,7 +247,7 @@ async function processStreaming(req, res, openaiBody, requestId) {
       'Access-Control-Allow-Origin': '*'
     });
     headersSent = true;
-    
+
     let isFirst = true;
     let hasError = false;
     let streamRequest = null;
@@ -262,7 +262,37 @@ async function processStreaming(req, res, openaiBody, requestId) {
             }
             if (event === '[DONE]') return;
             try {
-              if (modelInfo.endpoint === 'anthropic') {
+              if (modelInfo.provider === 'google') {
+                try {
+                  const parsed = safeJsonParse(event, 'gemini-stream');
+                  const candidate = parsed.candidates?.[0];
+                  if (candidate) {
+                    const parts = candidate.content?.parts || [];
+                    for (const part of parts) {
+                      if (part.text) {
+                        const chunk = {
+                          id: `chatcmpl-${requestId}`,
+                          object: 'chat.completion.chunk',
+                          created: Math.floor(Date.now() / 1000),
+                          model: model,
+                          choices: [{
+                            index: 0,
+                            delta: { content: part.text },
+                            finish_reason: candidate.finishReason === 'STOP' ? 'stop' : null,
+                            logprobs: null
+                          }]
+                        };
+                        if (!requestAborted) {
+                          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                        }
+                      }
+                    }
+                  }
+                  isFirst = false;
+                } catch (e) {
+                  log('[GEMINI-STREAM-ERR]', e.message, event.substring(0, 200));
+                }
+              } else if (modelInfo.endpoint === 'anthropic') {
                 try {
                   const parsed = safeJsonParse(event, 'anthropic-stream');
                   const { anthropicToOpenAIStreamingChunk } = require('./translators');
@@ -315,14 +345,14 @@ async function processStreaming(req, res, openaiBody, requestId) {
 
     if (!hasError && !requestAborted) {
       // Send final chunk and DONE
-      res.write(`data: {"id":"chatcmpl-${requestId}","object":"chat.completion.chunk","created":${Math.floor(Date.now()/1000)},"model":"${model}","choices":[{"index":0,"delta":{},"finish_reason":null,"logprobs":null}]}\n\n`);
+      res.write(`data: {"id":"chatcmpl-${requestId}","object":"chat.completion.chunk","created":${Math.floor(Date.now() / 1000)},"model":"${model}","choices":[{"index":0,"delta":{},"finish_reason":null,"logprobs":null}]}\n\n`);
       res.write('data: [DONE]\n\n');
     }
-    
+
     if (!requestAborted) {
       res.end();
     }
-    
+
   } catch (err) {
     log('[STREAM-PROXY-ERR]', err.message);
     // Only send error response if headers haven't been sent yet

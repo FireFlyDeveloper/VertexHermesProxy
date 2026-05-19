@@ -304,6 +304,81 @@ function buildGeminiBody(openaiBody) {
   return vertexBody;
 }
 
+function buildGeminiRequestBody(openaiBody) {
+  // Convert OpenAI format to Gemini format
+  const contents = [];
+  let systemInstruction = null;
+
+  const messages = openaiBody.messages || [];
+
+  for (const msg of messages) {
+    if (msg.role === 'system' || msg.role === 'developer') {
+      systemInstruction = { parts: [{ text: msg.content }] };
+      continue;
+    }
+
+    const role = msg.role === 'assistant' ? 'model' : 'user';
+    let parts = [];
+
+    if (typeof msg.content === 'string') {
+      parts.push({ text: msg.content });
+    } else if (Array.isArray(msg.content)) {
+      for (const item of msg.content) {
+        if (item.type === 'text') {
+          parts.push({ text: item.text });
+        } else if (item.type === 'image_url') {
+          const imageUrl = item.image_url?.url || '';
+          if (imageUrl.startsWith('data:')) {
+            const match = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
+            if (match) {
+              parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+            }
+          } else if (imageUrl.startsWith('gs://')) {
+            parts.push({ fileData: { mimeType: 'image/jpeg', fileUri: imageUrl } });
+          } else {
+            parts.push({ fileData: { mimeType: 'image/jpeg', fileUri: imageUrl } });
+          }
+        }
+      }
+    }
+
+    if (parts.length > 0) {
+      contents.push({ role, parts });
+    }
+  }
+
+  const generationConfig = {
+    temperature: openaiBody.temperature ?? 1,
+    maxOutputTokens: openaiBody.max_tokens || 8192,
+    topP: openaiBody.top_p ?? 0.95,
+    topK: openaiBody.top_k ?? 40,
+  };
+
+  // Remove undefined values
+  Object.keys(generationConfig).forEach(key => {
+    if (generationConfig[key] === undefined) delete generationConfig[key];
+  });
+
+  const requestBody = {
+    contents,
+    generationConfig,
+  };
+
+  if (systemInstruction) {
+    requestBody.systemInstruction = systemInstruction;
+  }
+
+  // Add safety settings (disabled for maximum compatibility)
+  requestBody.safetySettings = [
+    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+    { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' },
+    { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF' },
+    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' }
+  ];
+
+  return requestBody;
+}
+
 function buildAnthropicBody(openaiBody) {
   const messages = [];
   let system = null;
@@ -382,6 +457,7 @@ function buildDeepSeekBody(openaiBody) {
 }
 
 function buildRequestBody(openaiBody, info) {
+  if (info.provider === 'google') return buildGeminiRequestBody(openaiBody);
   if (info.endpoint === 'anthropic') return buildAnthropicBody(openaiBody);
   if (info.endpoint === 'publisher') return buildDeepSeekBody(openaiBody);
   if (info.endpoint === 'legacy') return buildGeminiBody(openaiBody);
