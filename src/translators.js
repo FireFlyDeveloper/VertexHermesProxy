@@ -19,7 +19,7 @@ function geminiToOpenAIStreamingChunk(vertexChunk, id, model, isFirst) {
 
     if (part.functionCall) {
       const fc = part.functionCall;
-      toolCalls.push({
+      const toolCall = {
         index: i,
         id: `call_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 10)}`,
         type: 'function',
@@ -27,7 +27,21 @@ function geminiToOpenAIStreamingChunk(vertexChunk, id, model, isFirst) {
           name: fc.name,
           arguments: JSON.stringify(fc.args || {})
         }
-      });
+      };
+
+      // CRITICAL: Capture thought_signature from Gemini response
+      if (part.thoughtSignature) {
+        // Store in extra_content as required by OpenAI compatibility
+        toolCall.extra_content = {
+          google: {
+            thought_signature: part.thoughtSignature
+          }
+        };
+        // Also store directly for easier access
+        toolCall.thought_signature = part.thoughtSignature;
+      }
+
+      toolCalls.push(toolCall);
     }
   }
 
@@ -86,14 +100,26 @@ function geminiToOpenAINonStreaming(events, id, model) {
         }
         if (part.functionCall) {
           const fc = part.functionCall;
-          toolCalls.push({
+          const toolCall = {
             id: `call_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 10)}`,
             type: 'function',
             function: {
               name: fc.name,
               arguments: JSON.stringify(fc.args || {})
             }
-          });
+          };
+
+          // CRITICAL: Capture thought_signature
+          if (part.thoughtSignature) {
+            toolCall.extra_content = {
+              google: {
+                thought_signature: part.thoughtSignature
+              }
+            };
+            toolCall.thought_signature = part.thoughtSignature;
+          }
+
+          toolCalls.push(toolCall);
         }
       }
 
@@ -107,7 +133,6 @@ function geminiToOpenAINonStreaming(events, id, model) {
         };
         finishReason = finishReasonMap[candidate.finishReason] || 'stop';
 
-        // If there are tool calls and finish reason is stop, it should be tool_calls
         if (toolCalls.length > 0 && finishReason === 'stop') {
           finishReason = 'tool_calls';
         }
@@ -351,14 +376,16 @@ function buildGeminiRequestBody(openaiBody) {
 
   const messages = openaiBody.messages || [];
 
-  for (const msg of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+
     if (msg.role === 'system' || msg.role === 'developer') {
       systemInstruction = { parts: [{ text: msg.content }] };
       continue;
     }
 
+    // Handle assistant messages with tool_calls (Gemini response with thought_signatures)
     if (msg.role === 'assistant' && msg.tool_calls) {
-      // Handle assistant message with tool calls
       const parts = [];
 
       // Add text content if present
@@ -366,8 +393,9 @@ function buildGeminiRequestBody(openaiBody) {
         parts.push({ text: msg.content });
       }
 
-      // Add function calls
-      for (const tc of msg.tool_calls) {
+      // Add function calls with thought signatures
+      for (let j = 0; j < msg.tool_calls.length; j++) {
+        const tc = msg.tool_calls[j];
         let args = {};
         if (tc.function?.arguments) {
           try {
@@ -378,20 +406,33 @@ function buildGeminiRequestBody(openaiBody) {
             args = {};
           }
         }
-        parts.push({
+
+        const functionCallPart = {
           functionCall: {
             name: tc.function?.name || 'unknown',
             args: args
           }
-        });
+        };
+
+        // CRITICAL: Preserve thought_signature for Gemini
+        // The signature is stored in extra_content.google.thought_signature
+        if (tc.extra_content?.google?.thought_signature) {
+          functionCallPart.thoughtSignature = tc.extra_content.google.thought_signature;
+        } else if (tc.thought_signature) {
+          functionCallPart.thoughtSignature = tc.thought_signature;
+        } else if (tc.thoughtSignature) {
+          functionCallPart.thoughtSignature = tc.thoughtSignature;
+        }
+
+        parts.push(functionCallPart);
       }
 
       contents.push({ role: 'model', parts });
       continue;
     }
 
+    // Handle tool responses
     if (msg.role === 'tool') {
-      // Handle tool response
       let responseData;
       try {
         responseData = typeof msg.content === 'string'
@@ -401,15 +442,14 @@ function buildGeminiRequestBody(openaiBody) {
         responseData = { result: msg.content };
       }
 
-      contents.push({
-        role: 'user',
-        parts: [{
-          functionResponse: {
-            name: msg.tool_call_id || 'unknown',
-            response: responseData
-          }
-        }]
-      });
+      const functionResponsePart = {
+        functionResponse: {
+          name: msg.name || msg.tool_call_id || 'unknown',
+          response: responseData
+        }
+      };
+
+      contents.push({ role: 'user', parts: [functionResponsePart] });
       continue;
     }
 
