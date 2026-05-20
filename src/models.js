@@ -1,26 +1,23 @@
-// models.js - Complete updated file
 const { config } = require('./config');
 
 // Model registry
 const MODEL_REGISTRY = {
   // Google Gemini
-  'gemini-3.1-flash-lite': { provider: 'google', location: 'global' },
-  'gemini-3.1-pro-preview': { provider: 'google', location: 'global' },
-  'gemini-2.0-flash-exp': { provider: 'google', location: 'global' },
-  'gemini-2.0-pro-exp': { provider: 'google', location: 'global' },
+  'gemini-3.1-flash-lite': { provider: 'google', endpoint: 'gemini', location: 'global' },
+  'gemini-3.1-pro-preview': { provider: 'google', endpoint: 'gemini', location: 'global' },
   // Moonshot
-  'moonshotai/kimi-k2-thinking-maas': { provider: 'moonshot', location: 'global' },
+  'moonshotai/kimi-k2-thinking-maas': { provider: 'moonshot', endpoint: 'openai', location: 'global' },
   // DeepSeek
-  'deepseek-ai/deepseek-v3.2-maas': { provider: 'deepseek', location: 'global' },
-  'deepseek-ai/deepseek-v3.1-maas': { provider: 'deepseek', location: 'us-west2' },
-  'deepseek-ai/deepseek-r1-0528-maas': { provider: 'deepseek', location: 'us-central1' },
+  'deepseek-ai/deepseek-v3.2-maas': { provider: 'deepseek', endpoint: 'openai', location: 'global' },
+  'deepseek-ai/deepseek-v3.1-maas': { provider: 'deepseek', endpoint: 'openai', location: 'us-west2' },
+  'deepseek-ai/deepseek-r1-0528-maas': { provider: 'deepseek', endpoint: 'publisher', location: 'us-central1' },
   // Anthropic Claude
-  'claude-haiku-4-5': { provider: 'anthropic', location: 'global' },
-  'claude-sonnet-4-6': { provider: 'anthropic', location: 'global' },
+  'claude-haiku-4-5': { provider: 'anthropic', endpoint: 'anthropic', location: 'global' },
+  'claude-sonnet-4-6': { provider: 'anthropic', endpoint: 'anthropic', location: 'global' },
   // Zhipu AI (GLM)
-  'zai-org/glm-4.7-maas': { provider: 'zhipu', location: 'global' },
+  'zai-org/glm-4.7-maas': { provider: 'zhipu', endpoint: 'openai', location: 'global' },
   // Alibaba Qwen
-  'qwen/qwen3-235b-a22b-instruct-2507-maas': { provider: 'qwen', location: 'us-south1' },
+  'qwen/qwen3-235b-a22b-instruct-2507-maas': { provider: 'qwen', endpoint: 'openai', location: 'us-south1' },
 };
 
 const MODEL_ALIASES = {
@@ -38,9 +35,14 @@ function resolveModel(requestedModel) {
 }
 
 function getModelInfo(model) {
-  return MODEL_REGISTRY[model] || MODEL_REGISTRY[config.DEFAULT_MODEL] || {
-    provider: 'google', location: 'global'
-  };
+  const info = MODEL_REGISTRY[model] || MODEL_REGISTRY[config.DEFAULT_MODEL];
+  if (!info) {
+    return { provider: 'unknown', endpoint: 'openai', location: 'global' };
+  }
+  if (!info.endpoint && info.provider !== 'google' && info.provider !== 'anthropic') {
+    info.endpoint = 'openai';
+  }
+  return info;
 }
 
 function getVertexUrl(model, info) {

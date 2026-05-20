@@ -262,39 +262,19 @@ async function processStreaming(req, res, openaiBody, requestId) {
             if (event === '[DONE]') return;
             try {
               if (modelInfo.provider === 'google') {
-                // Gemini streaming response format
+                // Gemini streaming
                 try {
                   const parsed = safeJsonParse(event, 'gemini-stream');
                   const chunk = geminiToOpenAIStreamingChunk(parsed, requestId, model, isFirst);
                   isFirst = false;
-
                   if (chunk && !requestAborted) {
                     res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-
-                    // If this chunk has tool_calls and finish_reason is tool_calls,
-                    // we might need to send an additional chunk for the tool call
-                    if (chunk.choices[0]?.delta?.tool_calls &&
-                      chunk.choices[0]?.finish_reason === 'tool_calls') {
-                      // Send a final empty chunk to signal completion
-                      const finalChunk = {
-                        id: `chatcmpl-${requestId}`,
-                        object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
-                        model: model,
-                        choices: [{
-                          index: 0,
-                          delta: {},
-                          finish_reason: 'tool_calls',
-                          logprobs: null
-                        }]
-                      };
-                      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-                    }
                   }
                 } catch (e) {
                   log('[GEMINI-STREAM-ERR]', e.message, event.substring(0, 200));
                 }
-              } else if (modelInfo.endpoint === 'anthropic') {
+              } else if (modelInfo.provider === 'anthropic') {
+                // Anthropic streaming (if needed)
                 try {
                   const parsed = safeJsonParse(event, 'anthropic-stream');
                   const chunk = anthropicToOpenAIStreamingChunk(parsed, requestId, model);
@@ -304,22 +284,17 @@ async function processStreaming(req, res, openaiBody, requestId) {
                 } catch {
                   log('[ANTHROPIC-SKIP]', event.substring(0, 100));
                 }
-              } else if (modelInfo.endpoint === 'openai' || modelInfo.endpoint === 'publisher') {
+              } else {
+                // OpenAI-compatible (DeepSeek, Moonshot, Qwen, Zhipu)
                 try {
                   const parsed = safeJsonParse(event, 'openai-stream');
+                  // Ensure model field is set
                   if (parsed.model) parsed.model = model;
                   if (!requestAborted) {
                     res.write(`data: ${JSON.stringify(parsed)}\n\n`);
                   }
                 } catch {
                   log('[OPENAI-SKIP]', event.substring(0, 100));
-                }
-              } else {
-                const parsed = safeJsonParse(event, 'gemini-stream');
-                const chunk = geminiToOpenAIStreamingChunk(parsed, requestId, model, isFirst);
-                isFirst = false;
-                if (chunk && !requestAborted) {
-                  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
                 }
               }
             } catch (e) {

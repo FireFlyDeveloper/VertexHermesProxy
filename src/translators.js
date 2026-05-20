@@ -245,131 +245,6 @@ function anthropicToOpenAINonStreaming(anthropicResponse, id, model) {
   };
 }
 
-function buildGeminiBody(openaiBody) {
-  const contents = [];
-  let systemInstruction = null;
-  const messages = openaiBody.messages || [];
-  let i = 0;
-
-  while (i < messages.length) {
-    const msg = messages[i];
-    if (msg.role === 'system' || msg.role === 'developer') {
-      if (typeof msg.content === 'string') systemInstruction = { parts: [{ text: msg.content }] };
-      i++; continue;
-    }
-    if (msg.role === 'tool' || msg.role === 'function') {
-      const toolGroup = [];
-      while (i < messages.length && (messages[i].role === 'tool' || messages[i].role === 'function')) {
-        toolGroup.push(messages[i]); i++;
-      }
-      const parts = toolGroup.map(t => {
-        let responseData;
-        if (typeof t.content === 'string') {
-          try { responseData = JSON.parse(t.content); } catch { responseData = { result: t.content }; }
-        } else if (t.content !== null && typeof t.content === 'object') {
-          responseData = t.content;
-        } else {
-          responseData = { result: String(t.content ?? '') };
-        }
-        return { functionResponse: { name: t.name || t.function?.name || 'unknown', response: responseData } };
-      });
-      contents.push({ role: 'user', parts });
-      continue;
-    }
-    const role = msg.role === 'assistant' ? 'model' : 'user';
-    let parts = [];
-    if (typeof msg.content === 'string') {
-      parts.push({ text: msg.content });
-    } else if (Array.isArray(msg.content)) {
-      for (const item of msg.content) {
-        if (item.type === 'text') parts.push({ text: item.text });
-        else if (item.type === 'image_url') {
-          const imageUrl = item.image_url?.url || '';
-          if (imageUrl.startsWith('data:')) {
-            const m = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
-            if (m) parts.push({ inlineData: { mimeType: m[1], data: m[2] } });
-          } else {
-            parts.push({ fileData: { mimeType: 'image/jpeg', fileUri: imageUrl } });
-          }
-        }
-      }
-    }
-    if (msg.tool_calls && msg.tool_calls.length > 0) {
-      for (const tc of msg.tool_calls) {
-        let args = {};
-        if (tc.function?.arguments) {
-          if (typeof tc.function.arguments === 'string') {
-            try { args = JSON.parse(tc.function.arguments); } catch { args = {}; }
-          } else if (typeof tc.function.arguments === 'object') {
-            args = tc.function.arguments;
-          }
-        }
-        const fcPart = { functionCall: { name: tc.function?.name || 'unknown', args } };
-        const sig = tc.extra_content?.google?.thought_signature || tc.thoughtSignature || tc.thought_signature;
-        if (sig) fcPart.thoughtSignature = sig;
-        parts.push(fcPart);
-      }
-    }
-    if (msg.function_call) {
-      let args = {};
-      if (typeof msg.function_call.arguments === 'string') {
-        try { args = JSON.parse(msg.function_call.arguments); } catch { args = {}; }
-      } else if (typeof msg.function_call.arguments === 'object') {
-        args = msg.function_call.arguments;
-      }
-      parts.push({ functionCall: { name: msg.function_call.name, args } });
-    }
-    if (parts.length > 0) contents.push({ role, parts });
-    i++;
-  }
-
-  const generationConfig = {
-    temperature: openaiBody.temperature ?? 1,
-    maxOutputTokens: openaiBody.max_tokens || 65535,
-    topP: openaiBody.top_p ?? 0.95,
-    topK: openaiBody.top_k ?? 40,
-    candidateCount: openaiBody.n || 1,
-    stopSequences: openaiBody.stop ? (Array.isArray(openaiBody.stop) ? openaiBody.stop : [openaiBody.stop]) : undefined
-  };
-  Object.keys(generationConfig).forEach(k => { if (generationConfig[k] === undefined) delete generationConfig[k]; });
-
-  let tools = null;
-  let toolConfig = null;
-  if (openaiBody.tools) {
-    tools = openaiBody.tools.map(t => ({
-      functionDeclarations: [{ name: t.function.name, description: t.function.description, parameters: t.function.parameters }]
-    }));
-  } else if (openaiBody.functions) {
-    tools = openaiBody.functions.map(f => ({
-      functionDeclarations: [{ name: f.name, description: f.description, parameters: f.parameters }]
-    }));
-  }
-
-  if (openaiBody.tool_choice === 'none') {
-    toolConfig = { functionCallingConfig: { mode: 'NONE' } };
-  } else if (openaiBody.tool_choice === 'auto' || openaiBody.tool_choice == null) {
-    toolConfig = { functionCallingConfig: { mode: 'AUTO' } };
-  } else if (typeof openaiBody.tool_choice === 'object' && openaiBody.tool_choice?.function?.name) {
-    toolConfig = { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [openaiBody.tool_choice.function.name] } };
-  }
-
-  const vertexBody = {
-    contents,
-    generationConfig,
-    safetySettings: [
-      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
-      { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' },
-      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF' },
-      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' }
-    ]
-  };
-  if (systemInstruction) vertexBody.systemInstruction = systemInstruction;
-  if (tools) vertexBody.tools = tools;
-  if (toolConfig) vertexBody.toolConfig = toolConfig;
-
-  return vertexBody;
-}
-
 function buildGeminiRequestBody(openaiBody) {
   const contents = [];
   let systemInstruction = null;
@@ -622,9 +497,8 @@ function buildDeepSeekBody(openaiBody) {
 
 function buildRequestBody(openaiBody, info) {
   if (info.provider === 'google') return buildGeminiRequestBody(openaiBody);
-  if (info.endpoint === 'anthropic') return buildAnthropicBody(openaiBody);
+  if (info.provider === 'anthropic') return buildAnthropicBody(openaiBody);
   if (info.endpoint === 'publisher') return buildDeepSeekBody(openaiBody);
-  if (info.endpoint === 'legacy') return buildGeminiBody(openaiBody);
   return openaiBody;
 }
 
