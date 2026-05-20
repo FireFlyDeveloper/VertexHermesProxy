@@ -248,140 +248,161 @@ function anthropicToOpenAINonStreaming(anthropicResponse, id, model) {
 function buildGeminiRequestBody(openaiBody) {
   const contents = [];
   let systemInstruction = null;
-
   const messages = openaiBody.messages || [];
+  let i = 0;
 
-  for (let i = 0; i < messages.length; i++) {
+  while (i < messages.length) {
     const msg = messages[i];
 
+    // System message
     if (msg.role === 'system' || msg.role === 'developer') {
-      systemInstruction = { parts: [{ text: msg.content }] };
+      if (typeof msg.content === 'string') {
+        systemInstruction = { parts: [{ text: msg.content }] };
+      }
+      i++;
       continue;
     }
 
-    // Handle assistant messages with tool_calls (Gemini response with thought_signatures)
-    if (msg.role === 'assistant' && msg.tool_calls) {
+    // Assistant message with tool_calls (model turn)
+    if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
       const parts = [];
-
-      // Add text content if present
       if (msg.content) {
         parts.push({ text: msg.content });
       }
-
-      // Add function calls with thought signatures
-      for (let j = 0; j < msg.tool_calls.length; j++) {
-        const tc = msg.tool_calls[j];
+      for (const tc of msg.tool_calls) {
         let args = {};
         if (tc.function?.arguments) {
           try {
             args = typeof tc.function.arguments === 'string'
               ? JSON.parse(tc.function.arguments)
               : tc.function.arguments;
-          } catch {
-            args = {};
-          }
+          } catch { /* keep empty */ }
         }
-
-        const functionCallPart = {
+        const fcPart = {
           functionCall: {
-            name: tc.function?.name || 'unknown',
+            name: tc.function.name,
             args: args
           }
         };
-
-        // CRITICAL: Preserve thought_signature for Gemini
-        // The signature is stored in extra_content.google.thought_signature
-        if (tc.extra_content?.google?.thought_signature) {
-          functionCallPart.thoughtSignature = tc.extra_content.google.thought_signature;
-        } else if (tc.thought_signature) {
-          functionCallPart.thoughtSignature = tc.thought_signature;
-        } else if (tc.thoughtSignature) {
-          functionCallPart.thoughtSignature = tc.thoughtSignature;
+        // Preserve thought signature (stored in extra_content or direct)
+        const signature = tc.extra_content?.google?.thought_signature ||
+          tc.thought_signature ||
+          tc.thoughtSignature;
+        if (signature) {
+          fcPart.thoughtSignature = signature;
         }
-
-        parts.push(functionCallPart);
+        parts.push(fcPart);
       }
-
       contents.push({ role: 'model', parts });
+      i++;
       continue;
     }
 
-    // Handle tool responses
-    if (msg.role === 'tool') {
-      let responseData;
-      try {
-        responseData = typeof msg.content === 'string'
-          ? JSON.parse(msg.content)
-          : msg.content;
-      } catch {
-        responseData = { result: msg.content };
-      }
-
-      const functionResponsePart = {
-        functionResponse: {
-          name: msg.name || msg.tool_call_id || 'unknown',
-          response: responseData
+    // Assistant message without tool_calls (plain text)
+    if (msg.role === 'assistant' && (!msg.tool_calls || msg.tool_calls.length === 0)) {
+      let parts = [];
+      if (typeof msg.content === 'string') {
+        parts.push({ text: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        for (const item of msg.content) {
+          if (item.type === 'text') parts.push({ text: item.text });
         }
-      };
-
-      contents.push({ role: 'user', parts: [functionResponsePart] });
+      }
+      if (parts.length) {
+        const modelPart = { role: 'model', parts };
+        // Optional thought signature on text response (recommended)
+        const sig = msg.extra_content?.google?.thought_signature ||
+          msg.thought_signature ||
+          msg.thoughtSignature;
+        if (sig) modelPart.thoughtSignature = sig;
+        contents.push(modelPart);
+      }
+      i++;
       continue;
     }
 
-    // Regular user/assistant messages
-    const role = msg.role === 'assistant' ? 'model' : 'user';
-    let parts = [];
+    // Tool responses – aggregate consecutive tool messages into one user turn
+    if (msg.role === 'tool') {
+      const toolResponses = [];
+      // Collect all consecutive tool messages
+      while (i < messages.length && messages[i].role === 'tool') {
+        const toolMsg = messages[i];
+        let responseData;
+        try {
+          responseData = typeof toolMsg.content === 'string'
+            ? JSON.parse(toolMsg.content)
+            : toolMsg.content;
+        } catch {
+          responseData = { result: toolMsg.content };
+        }
+        toolResponses.push({
+          name: toolMsg.name || toolMsg.tool_call_id || 'unknown',
+          response: responseData
+        });
+        i++;
+      }
+      // Create a single user turn with all functionResponse parts
+      const parts = toolResponses.map(tr => ({
+        functionResponse: {
+          name: tr.name,
+          response: tr.response
+        }
+      }));
+      contents.push({ role: 'user', parts });
+      continue;
+    }
 
-    if (typeof msg.content === 'string') {
-      parts.push({ text: msg.content });
-    } else if (Array.isArray(msg.content)) {
-      for (const item of msg.content) {
-        if (item.type === 'text') {
-          parts.push({ text: item.text });
-        } else if (item.type === 'image_url') {
-          const imageUrl = item.image_url?.url || '';
-          if (imageUrl.startsWith('data:')) {
-            const match = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
-            if (match) {
-              parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+    // Regular user message
+    if (msg.role === 'user') {
+      let parts = [];
+      if (typeof msg.content === 'string') {
+        parts.push({ text: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        for (const item of msg.content) {
+          if (item.type === 'text') {
+            parts.push({ text: item.text });
+          } else if (item.type === 'image_url') {
+            const imageUrl = item.image_url?.url || '';
+            if (imageUrl.startsWith('data:')) {
+              const match = imageUrl.match(/^data:([^;]+);base64,(.+)$/);
+              if (match) {
+                parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+              }
+            } else if (imageUrl.startsWith('gs://')) {
+              parts.push({ fileData: { mimeType: 'image/jpeg', fileUri: imageUrl } });
+            } else {
+              parts.push({ fileData: { mimeType: 'image/jpeg', fileUri: imageUrl } });
             }
-          } else if (imageUrl.startsWith('gs://')) {
-            parts.push({ fileData: { mimeType: 'image/jpeg', fileUri: imageUrl } });
-          } else {
-            parts.push({ fileData: { mimeType: 'image/jpeg', fileUri: imageUrl } });
           }
         }
       }
+      if (parts.length) {
+        contents.push({ role: 'user', parts });
+      }
+      i++;
+      continue;
     }
 
-    if (parts.length > 0) {
-      contents.push({ role, parts });
-    }
+    // Skip any other role (e.g., function – legacy)
+    i++;
   }
 
+  // Build rest of request (generation config, tools, etc.)
   const generationConfig = {
     temperature: openaiBody.temperature ?? 1,
     maxOutputTokens: openaiBody.max_tokens || 8192,
     topP: openaiBody.top_p ?? 0.95,
     topK: openaiBody.top_k ?? 40,
   };
-
-  // Remove undefined values
-  Object.keys(generationConfig).forEach(key => {
-    if (generationConfig[key] === undefined) delete generationConfig[key];
+  Object.keys(generationConfig).forEach(k => {
+    if (generationConfig[k] === undefined) delete generationConfig[k];
   });
 
-  const requestBody = {
-    contents,
-    generationConfig,
-  };
+  const requestBody = { contents, generationConfig };
+  if (systemInstruction) requestBody.systemInstruction = systemInstruction;
 
-  if (systemInstruction) {
-    requestBody.systemInstruction = systemInstruction;
-  }
-
-  // Add tools if present
-  if (openaiBody.tools && openaiBody.tools.length > 0) {
+  // Tools
+  if (openaiBody.tools && openaiBody.tools.length) {
     requestBody.tools = openaiBody.tools.map(tool => ({
       functionDeclarations: [{
         name: tool.function.name,
@@ -391,7 +412,7 @@ function buildGeminiRequestBody(openaiBody) {
     }));
   }
 
-  // Add tool config
+  // Tool config
   if (openaiBody.tool_choice) {
     if (openaiBody.tool_choice === 'none') {
       requestBody.toolConfig = { functionCallingConfig: { mode: 'NONE' } };
@@ -407,7 +428,7 @@ function buildGeminiRequestBody(openaiBody) {
     }
   }
 
-  // Add safety settings (disabled for maximum compatibility)
+  // Safety settings off
   requestBody.safetySettings = [
     { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
     { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' },
