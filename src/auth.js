@@ -67,7 +67,7 @@ async function getOAuthTokenFromServiceAccount() {
           } else {
             reject(new Error(`OAuth error: ${data}`));
           }
-        } catch (e) { reject(new Error(`OAuth parse error: ${data}`)); }
+        } catch { reject(new Error(`OAuth parse error: ${data}`)); }
       });
     });
     req.on('error', reject);
@@ -104,7 +104,7 @@ async function refreshAccessToken() {
           } else {
             reject(new Error(`Token refresh failed: ${data}`));
           }
-        } catch (e) { reject(new Error(`Token refresh parse error: ${data}`)); }
+        } catch { reject(new Error(`Token refresh parse error: ${data}`)); }
       });
     });
     req.on('error', reject);
@@ -195,7 +195,7 @@ async function exchangeCodeForTokens(code) {
           } else {
             reject(new Error(`Token exchange failed: ${data}`));
           }
-        } catch (e) { reject(new Error(`Token exchange parse error: ${data}`)); }
+        } catch { reject(new Error(`Token exchange parse error: ${data}`)); }
       });
     });
     req.on('error', reject);

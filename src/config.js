@@ -1,5 +1,3 @@
-const path = require('path');
-
 // Environment variables with defaults
 const config = {
   // Server

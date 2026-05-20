@@ -6,10 +6,16 @@
   "dependencies": {
     "dotenv": "^17.4.2"
   },
-  "devDependencies": {},
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.4.0",
+    "globals": "^17.6.0"
+  },
   "scripts": {
     "start": "bun index.js",
-    "dev": "DEBUG=1 node index.js"
+    "dev": "DEBUG=1 node index.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
   },
   "repository": {
     "type": "git",

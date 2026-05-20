@@ -6,13 +6,14 @@ const {
   resolveModel,
   getModelInfo,
   getVertexUrl,
-  generateId,
   safeJsonParse
 } = require('./models');
 const { requestQueue, retryWithBackoff } = require('./queue');
 const {
   geminiToOpenAIStreamingChunk,
+  geminiToOpenAINonStreaming,
   anthropicToOpenAIStreamingChunk,
+  anthropicToOpenAINonStreaming,
   buildRequestBody,
   getRequestHeaders
 } = require('./translators');
@@ -193,7 +194,6 @@ async function processNonStreaming(req, res, openaiBody, requestId) {
   let response;
   if (modelInfo.endpoint === 'anthropic') {
     const parsed = safeJsonParse(vertexResponse.data, 'anthropic-response');
-    const { anthropicToOpenAINonStreaming } = require('./translators');
     response = anthropicToOpenAINonStreaming(parsed, requestId, model);
   } else if (modelInfo.endpoint === 'openai' || modelInfo.endpoint === 'publisher') {
     response = safeJsonParse(vertexResponse.data, 'openai-response');
@@ -202,7 +202,6 @@ async function processNonStreaming(req, res, openaiBody, requestId) {
     const parser = new SseParser();
     const events = parser.feed(vertexResponse.data);
     const events2 = parser.flush();
-    const { geminiToOpenAINonStreaming } = require('./translators');
     response = geminiToOpenAINonStreaming([...events, ...events2], requestId, model);
   }
 
@@ -263,44 +262,46 @@ async function processStreaming(req, res, openaiBody, requestId) {
             if (event === '[DONE]') return;
             try {
               if (modelInfo.provider === 'google') {
+                // Gemini streaming response format
                 try {
                   const parsed = safeJsonParse(event, 'gemini-stream');
-                  const candidate = parsed.candidates?.[0];
-                  if (candidate) {
-                    const parts = candidate.content?.parts || [];
-                    for (const part of parts) {
-                      if (part.text) {
-                        const chunk = {
-                          id: `chatcmpl-${requestId}`,
-                          object: 'chat.completion.chunk',
-                          created: Math.floor(Date.now() / 1000),
-                          model: model,
-                          choices: [{
-                            index: 0,
-                            delta: { content: part.text },
-                            finish_reason: candidate.finishReason === 'STOP' ? 'stop' : null,
-                            logprobs: null
-                          }]
-                        };
-                        if (!requestAborted) {
-                          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                        }
-                      }
+                  const chunk = geminiToOpenAIStreamingChunk(parsed, requestId, model, isFirst);
+                  isFirst = false;
+
+                  if (chunk && !requestAborted) {
+                    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+
+                    // If this chunk has tool_calls and finish_reason is tool_calls,
+                    // we might need to send an additional chunk for the tool call
+                    if (chunk.choices[0]?.delta?.tool_calls &&
+                      chunk.choices[0]?.finish_reason === 'tool_calls') {
+                      // Send a final empty chunk to signal completion
+                      const finalChunk = {
+                        id: `chatcmpl-${requestId}`,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: model,
+                        choices: [{
+                          index: 0,
+                          delta: {},
+                          finish_reason: 'tool_calls',
+                          logprobs: null
+                        }]
+                      };
+                      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
                     }
                   }
-                  isFirst = false;
                 } catch (e) {
                   log('[GEMINI-STREAM-ERR]', e.message, event.substring(0, 200));
                 }
               } else if (modelInfo.endpoint === 'anthropic') {
                 try {
                   const parsed = safeJsonParse(event, 'anthropic-stream');
-                  const { anthropicToOpenAIStreamingChunk } = require('./translators');
                   const chunk = anthropicToOpenAIStreamingChunk(parsed, requestId, model);
                   if (chunk && !requestAborted) {
                     res.write(`data: ${JSON.stringify(chunk)}\n\n`);
                   }
-                } catch (e) {
+                } catch {
                   log('[ANTHROPIC-SKIP]', event.substring(0, 100));
                 }
               } else if (modelInfo.endpoint === 'openai' || modelInfo.endpoint === 'publisher') {
@@ -310,12 +311,11 @@ async function processStreaming(req, res, openaiBody, requestId) {
                   if (!requestAborted) {
                     res.write(`data: ${JSON.stringify(parsed)}\n\n`);
                   }
-                } catch (e) {
+                } catch {
                   log('[OPENAI-SKIP]', event.substring(0, 100));
                 }
               } else {
                 const parsed = safeJsonParse(event, 'gemini-stream');
-                const { geminiToOpenAIStreamingChunk } = require('./translators');
                 const chunk = geminiToOpenAIStreamingChunk(parsed, requestId, model, isFirst);
                 isFirst = false;
                 if (chunk && !requestAborted) {

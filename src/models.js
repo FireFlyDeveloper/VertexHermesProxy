@@ -1,5 +1,5 @@
 // models.js - Complete updated file
-const { config, log } = require('./config');
+const { config } = require('./config');
 
 // Model registry
 const MODEL_REGISTRY = {
@@ -84,7 +84,11 @@ function safeJsonParse(str, ctx) {
   } catch (e) {
     const preview = str.substring(0, 100).replace(/\s+/g, ' ');
     console.error('[JSON-FAIL]', ctx, preview, '...');
-    throw new Error(`JSON parse failed (${ctx}): ${e.message}`);
+
+    throw new Error(
+      `JSON parse failed (${ctx}): ${e instanceof Error ? e.message : String(e)}`,
+      { cause: e }
+    );
   }
 }
 

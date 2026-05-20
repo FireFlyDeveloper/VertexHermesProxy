@@ -1,47 +1,69 @@
 const { log } = require('./config');
 
-function mapGeminiFinishReason(vertexFinishReason, hasToolCalls) {
-  if (!vertexFinishReason) return null;
-  const map = {
-    'STOP': hasToolCalls ? 'tool_calls' : 'stop',
-    'MAX_TOKENS': 'length',
-    'SAFETY': 'content_filter',
-    'RECITATION': 'content_filter',
-    'OTHER': 'stop'
-  };
-  return map[vertexFinishReason] || 'stop';
-}
-
 function geminiToOpenAIStreamingChunk(vertexChunk, id, model, isFirst) {
   const candidate = vertexChunk.candidates?.[0];
   if (!candidate) return null;
+
   const parts = candidate.content?.parts || [];
   let delta = {};
-  let hasToolCalls = false;
+  let toolCalls = [];
+
   if (isFirst) delta.role = 'assistant';
-  for (const part of parts) {
-    if (part.text != null) delta.content = part.text;
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+
+    if (part.text != null) {
+      delta.content = part.text;
+    }
+
     if (part.functionCall) {
-      hasToolCalls = true;
       const fc = part.functionCall;
-      const tc = {
-        index: 0,
-        id: `call_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 6)}`,
+      toolCalls.push({
+        index: i,
+        id: `call_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 10)}`,
         type: 'function',
-        function: { name: fc.name, arguments: JSON.stringify(fc.args || {}) }
-      };
-      if (part.thoughtSignature || part.thought_signature) {
-        tc.extra_content = { google: { thought_signature: part.thoughtSignature || part.thought_signature } };
-      }
-      delta.tool_calls = [tc];
+        function: {
+          name: fc.name,
+          arguments: JSON.stringify(fc.args || {})
+        }
+      });
     }
   }
+
+  if (toolCalls.length > 0) {
+    delta.tool_calls = toolCalls;
+  }
+
+  // Determine finish reason
+  let finishReason = null;
+  if (candidate.finishReason) {
+    const finishReasonMap = {
+      'STOP': 'stop',
+      'MAX_TOKENS': 'length',
+      'SAFETY': 'content_filter',
+      'RECITATION': 'content_filter',
+      'OTHER': 'stop'
+    };
+    finishReason = finishReasonMap[candidate.finishReason] || 'stop';
+
+    // If there are tool calls and finish reason is stop, it should be tool_calls
+    if (toolCalls.length > 0 && finishReason === 'stop') {
+      finishReason = 'tool_calls';
+    }
+  }
+
   return {
     id: `chatcmpl-${id}`,
     object: 'chat.completion.chunk',
     created: Math.floor(Date.now() / 1000),
     model: model,
-    choices: [{ index: 0, delta: delta, finish_reason: mapGeminiFinishReason(candidate.finishReason, hasToolCalls), logprobs: null }]
+    choices: [{
+      index: 0,
+      delta: delta,
+      finish_reason: finishReason,
+      logprobs: null
+    }]
   };
 }
 
@@ -49,32 +71,52 @@ function geminiToOpenAINonStreaming(events, id, model) {
   let fullText = '';
   const toolCalls = [];
   let finishReason = 'stop';
-  let hasToolCalls = false;
+
   for (const event of events) {
     if (event === '[DONE]') continue;
     try {
       const chunk = JSON.parse(event);
       const candidate = chunk.candidates?.[0];
       if (!candidate) continue;
-      for (const part of candidate.content?.parts || []) {
-        if (part.text != null) fullText += part.text;
+
+      const parts = candidate.content?.parts || [];
+      for (const part of parts) {
+        if (part.text != null) {
+          fullText += part.text;
+        }
         if (part.functionCall) {
-          hasToolCalls = true;
           const fc = part.functionCall;
-          const tc = {
-            id: `call_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 6)}`,
+          toolCalls.push({
+            id: `call_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 10)}`,
             type: 'function',
-            function: { name: fc.name, arguments: JSON.stringify(fc.args || {}) }
-          };
-          if (part.thoughtSignature || part.thought_signature) {
-            tc.extra_content = { google: { thought_signature: part.thoughtSignature || part.thought_signature } };
-          }
-          toolCalls.push(tc);
+            function: {
+              name: fc.name,
+              arguments: JSON.stringify(fc.args || {})
+            }
+          });
         }
       }
-      if (candidate.finishReason) finishReason = mapGeminiFinishReason(candidate.finishReason, hasToolCalls);
-    } catch (e) { log('[GEMINI-PARSE-ERR]', e.message); }
+
+      if (candidate.finishReason) {
+        const finishReasonMap = {
+          'STOP': 'stop',
+          'MAX_TOKENS': 'length',
+          'SAFETY': 'content_filter',
+          'RECITATION': 'content_filter',
+          'OTHER': 'stop'
+        };
+        finishReason = finishReasonMap[candidate.finishReason] || 'stop';
+
+        // If there are tool calls and finish reason is stop, it should be tool_calls
+        if (toolCalls.length > 0 && finishReason === 'stop') {
+          finishReason = 'tool_calls';
+        }
+      }
+    } catch (e) {
+      log('[GEMINI-PARSE-ERR]', e.message);
+    }
   }
+
   return {
     id: `chatcmpl-${id}`,
     object: 'chat.completion',
@@ -87,7 +129,6 @@ function geminiToOpenAINonStreaming(events, id, model) {
         content: fullText || null,
         refusal: null,
         tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
-        function_call: undefined
       },
       finish_reason: finishReason,
       logprobs: null
@@ -305,7 +346,6 @@ function buildGeminiBody(openaiBody) {
 }
 
 function buildGeminiRequestBody(openaiBody) {
-  // Convert OpenAI format to Gemini format
   const contents = [];
   let systemInstruction = null;
 
@@ -317,6 +357,63 @@ function buildGeminiRequestBody(openaiBody) {
       continue;
     }
 
+    if (msg.role === 'assistant' && msg.tool_calls) {
+      // Handle assistant message with tool calls
+      const parts = [];
+
+      // Add text content if present
+      if (msg.content) {
+        parts.push({ text: msg.content });
+      }
+
+      // Add function calls
+      for (const tc of msg.tool_calls) {
+        let args = {};
+        if (tc.function?.arguments) {
+          try {
+            args = typeof tc.function.arguments === 'string'
+              ? JSON.parse(tc.function.arguments)
+              : tc.function.arguments;
+          } catch {
+            args = {};
+          }
+        }
+        parts.push({
+          functionCall: {
+            name: tc.function?.name || 'unknown',
+            args: args
+          }
+        });
+      }
+
+      contents.push({ role: 'model', parts });
+      continue;
+    }
+
+    if (msg.role === 'tool') {
+      // Handle tool response
+      let responseData;
+      try {
+        responseData = typeof msg.content === 'string'
+          ? JSON.parse(msg.content)
+          : msg.content;
+      } catch {
+        responseData = { result: msg.content };
+      }
+
+      contents.push({
+        role: 'user',
+        parts: [{
+          functionResponse: {
+            name: msg.tool_call_id || 'unknown',
+            response: responseData
+          }
+        }]
+      });
+      continue;
+    }
+
+    // Regular user/assistant messages
     const role = msg.role === 'assistant' ? 'model' : 'user';
     let parts = [];
 
@@ -366,6 +463,33 @@ function buildGeminiRequestBody(openaiBody) {
 
   if (systemInstruction) {
     requestBody.systemInstruction = systemInstruction;
+  }
+
+  // Add tools if present
+  if (openaiBody.tools && openaiBody.tools.length > 0) {
+    requestBody.tools = openaiBody.tools.map(tool => ({
+      functionDeclarations: [{
+        name: tool.function.name,
+        description: tool.function.description,
+        parameters: tool.function.parameters
+      }]
+    }));
+  }
+
+  // Add tool config
+  if (openaiBody.tool_choice) {
+    if (openaiBody.tool_choice === 'none') {
+      requestBody.toolConfig = { functionCallingConfig: { mode: 'NONE' } };
+    } else if (openaiBody.tool_choice === 'auto' || openaiBody.tool_choice === 'required') {
+      requestBody.toolConfig = { functionCallingConfig: { mode: 'AUTO' } };
+    } else if (typeof openaiBody.tool_choice === 'object' && openaiBody.tool_choice.function) {
+      requestBody.toolConfig = {
+        functionCallingConfig: {
+          mode: 'ANY',
+          allowedFunctionNames: [openaiBody.tool_choice.function.name]
+        }
+      };
+    }
   }
 
   // Add safety settings (disabled for maximum compatibility)
