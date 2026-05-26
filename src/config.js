@@ -1,4 +1,6 @@
 // Environment variables with defaults
+require('dotenv').config();
+
 const config = {
   // Server
   PORT: parseInt(process.env.PORT || '3000', 10),
